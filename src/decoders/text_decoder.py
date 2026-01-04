@@ -1,0 +1,263 @@
+"""
+Text decoder for byte-level O-JEPA.
+
+Generates UTF-8 text bytes from embeddings.
+"""
+
+from typing import Optional, List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .base import BaseDecoder
+from ..config import TextDecoderConfig
+from ..layers import RMSNorm, MultiHeadAttention, SwiGLU
+
+
+class TextDecoderBlock(nn.Module):
+    """Causal transformer block for autoregressive text generation."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        max_seq_len: int = 1024,
+    ):
+        super().__init__()
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+
+        self.attn = MultiHeadAttention(
+            dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            bias=False,
+            use_rope=True,
+            max_seq_len=max_seq_len,
+        )
+
+        mlp_dim = int(dim * 4 * 2 / 3)
+        mlp_dim = ((mlp_dim + 255) // 256) * 256
+        self.ffn = SwiGLU(dim=dim, hidden_dim=mlp_dim, dropout=dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        is_causal: bool = True,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), is_causal=is_causal)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class TextDecoder(BaseDecoder):
+    """
+    Text decoder that generates UTF-8 bytes from embeddings.
+
+    Architecture:
+    1. Project embedding to sequence of hidden states
+    2. Apply causal transformer layers
+    3. Output logits over 256 byte values
+
+    Args:
+        config: TextDecoderConfig with model hyperparameters
+    """
+
+    def __init__(self, config: TextDecoderConfig):
+        super().__init__(config.input_dim, config.hidden_dim)
+        self.config = config
+        self.vocab_size = config.vocab_size  # 256 bytes
+        self.max_output_len = config.max_output_len
+
+        # Project embedding to initial sequence
+        self.embed_proj = nn.Linear(config.input_dim, config.hidden_dim)
+
+        # Byte embedding for autoregressive input
+        self.byte_embed = nn.Embedding(config.vocab_size, config.hidden_dim)
+
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            TextDecoderBlock(
+                dim=config.hidden_dim,
+                num_heads=config.num_heads,
+                dropout=config.dropout,
+                max_seq_len=config.max_output_len,
+            )
+            for _ in range(config.num_layers)
+        ])
+
+        # Output head
+        self.norm = RMSNorm(config.hidden_dim)
+        self.output_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
+
+        # Special tokens
+        self.bos_token = 0  # Start of sequence (null byte)
+        self.eos_token = 0  # End of sequence (null byte)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.embed_proj.weight, std=0.02)
+        nn.init.trunc_normal_(self.byte_embed.weight, std=0.02)
+        nn.init.trunc_normal_(self.output_head.weight, std=0.02)
+
+    def forward(
+        self,
+        embedding: torch.Tensor,
+        target_bytes: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute output logits for text generation.
+
+        Args:
+            embedding: Input embedding [batch, embed_dim]
+            target_bytes: Target byte sequence for teacher forcing [batch, seq_len]
+
+        Returns:
+            Logits over byte vocabulary [batch, seq_len, 256]
+        """
+        batch_size = embedding.shape[0]
+
+        # Project embedding to hidden dim
+        embed_hidden = self.embed_proj(embedding)  # [batch, hidden_dim]
+
+        if target_bytes is not None:
+            # Teacher forcing: use target bytes as input
+            seq_len = target_bytes.shape[1]
+
+            # Embed target bytes (shifted right by 1)
+            byte_embeds = self.byte_embed(target_bytes)  # [batch, seq_len, hidden_dim]
+
+            # Prepend embedding as first token
+            embed_hidden = embed_hidden.unsqueeze(1)  # [batch, 1, hidden_dim]
+            x = torch.cat([embed_hidden, byte_embeds[:, :-1, :]], dim=1)
+        else:
+            # No target: just use embedding
+            x = embed_hidden.unsqueeze(1)  # [batch, 1, hidden_dim]
+
+        # Apply transformer layers
+        for layer in self.layers:
+            x = layer(x, is_causal=True)
+
+        # Output logits
+        x = self.norm(x)
+        logits = self.output_head(x)  # [batch, seq_len, 256]
+
+        return logits
+
+    def generate(
+        self,
+        embedding: torch.Tensor,
+        max_len: Optional[int] = None,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+    ) -> List[bytes]:
+        """
+        Generate text bytes autoregressively.
+
+        Args:
+            embedding: Input embedding [batch, embed_dim]
+            max_len: Maximum output length
+            temperature: Sampling temperature
+            top_k: Top-k sampling (None for greedy)
+
+        Returns:
+            List of generated byte strings
+        """
+        max_len = max_len or self.max_output_len
+        batch_size = embedding.shape[0]
+        device = embedding.device
+
+        # Project embedding to hidden dim
+        embed_hidden = self.embed_proj(embedding)  # [batch, hidden_dim]
+
+        # Start with embedding
+        x = embed_hidden.unsqueeze(1)  # [batch, 1, hidden_dim]
+
+        # Generated tokens
+        generated = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
+
+        for _ in range(max_len):
+            # Apply transformer layers
+            hidden = x
+            for layer in self.layers:
+                hidden = layer(hidden, is_causal=True)
+
+            # Get logits for last position
+            hidden = self.norm(hidden)
+            logits = self.output_head(hidden[:, -1, :])  # [batch, 256]
+
+            # Apply temperature
+            logits = logits / temperature
+
+            # Top-k sampling
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float('-inf')
+
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [batch, 1]
+
+            # Append to generated
+            generated = torch.cat([generated, next_token], dim=1)
+
+            # Check for EOS (null byte)
+            if (next_token == self.eos_token).all():
+                break
+
+            # Embed and append to sequence
+            next_embed = self.byte_embed(next_token)  # [batch, 1, hidden_dim]
+            x = torch.cat([x, next_embed], dim=1)
+
+        # Convert to bytes
+        results = []
+        for i in range(batch_size):
+            tokens = generated[i].tolist()
+            # Truncate at EOS
+            if self.eos_token in tokens:
+                tokens = tokens[:tokens.index(self.eos_token)]
+            results.append(bytes(tokens))
+
+        return results
+
+    def compute_loss(
+        self,
+        embedding: torch.Tensor,
+        target_bytes: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute cross-entropy loss for text generation.
+
+        Args:
+            embedding: Input embedding [batch, embed_dim]
+            target_bytes: Target byte sequence [batch, seq_len]
+            attention_mask: Optional mask [batch, seq_len]
+
+        Returns:
+            Cross-entropy loss (scalar)
+        """
+        logits = self.forward(embedding, target_bytes)  # [batch, seq_len, 256]
+
+        # Flatten for loss computation
+        logits_flat = logits.reshape(-1, self.vocab_size)
+        targets_flat = target_bytes.reshape(-1)
+
+        if attention_mask is not None:
+            mask_flat = attention_mask.reshape(-1)
+            loss = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+            loss = (loss * mask_flat).sum() / mask_flat.sum().clamp(min=1e-9)
+        else:
+            loss = F.cross_entropy(logits_flat, targets_flat)
+
+        return loss
+
+    def extra_repr(self) -> str:
+        return (
+            f"input_dim={self.input_dim}, "
+            f"hidden_dim={self.hidden_dim}, "
+            f"vocab_size={self.vocab_size}"
+        )

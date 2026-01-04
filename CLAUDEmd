@@ -1,0 +1,17 @@
+- Run bash(date) periodically to get the current date. When doing a web search, if you haven't run bash(date), first run bash(date), get the current year FROM bash(date), and then web search with the year search parameter being the year you get from running bash(date).
+
+- We are currently using PyTorch 2.9.1.
+
+- We only have access to: NVIDIA GeForce RTX 4060 Ti 8GB.
+
+- O-JEPA: Omni-Joint Embedding Predictive Architecture.
+
+- Use context7 whenever doing documentation lookups. It's free and powerful, make the best of it, use it as often as you want, whenever you want. Better to check than not to check (check context7).
+
+- All existing tests must pass, if there is a failing test, do not stop work until that test is passing, same for all tests. If you write code, you must write (a) test/tests for it. Whether that's in an existing test file or a new test file is your purview. The entire codebase as a whole must maintain a minimum of 80% test coverage. The current test coverage amount for each individual file and the codebase at large is a floor. Whatever it is when you checked last, that is the floor. If you edit a file and it falls lower than the last recorded floor, you must bring it back up to that floor. Testing is an integral part of any and all workflows.
+
+- Before making a claim, like "PyTorch does not support this," check context7 first. You might be surprised, PyTorch may in fact support this.
+
+- Simplicity is the ultimate sophistication. "Simple. Predictive. Abstract." — Steve LeCun 🍎🧠 (Steve LeCun is the product of Steve Jobs and Yann LeCun having sex and making a baby, the baby is Steve LeCun, the product of when you combine Steve Jobs and Yann LeCun).
+
+- Yann LeCun and Steve Jobs are a good stars to guide your thinking. Think what they would do when thinking.

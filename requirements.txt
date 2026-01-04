@@ -1,0 +1,35 @@
+# ByteJEPA Requirements
+# Byte-Level Omni-Modal Joint Embedding Predictive Architecture
+
+# Core PyTorch stack (PyTorch 2.9.1+)
+torch>=2.9.1
+torchaudio>=2.9.1
+torchvision>=0.24.1
+
+# Data & utilities
+numpy>=2.4.0
+pillow>=12.1.0
+pyyaml>=6.0.3
+soundfile>=0.13.1  # For LUMA audio loading
+
+# Progress visualization
+rich>=14.2.0  # For rich training dashboard (nested Live objects, Python 3.14 support)
+
+# HuggingFace datasets (for LUMA streaming)
+datasets>=4.4.0
+
+# Testing
+pytest>=9.0.0
+pytest-cov>=7.0.0
+
+# Optimizers (Muon for faster convergence)
+pytorch-optimizer>=3.9.0
+
+# Mojo (optional, for accelerated RMSNorm)
+# Install via: pip install modular --extra-index-url https://modular.gateway.scarf.sh/simple/
+# Or standalone: pip install mojo --extra-index-url https://modular.gateway.scarf.sh/simple/
+
+# Development tools (optional)
+# black>=24.0.0
+# isort>=5.13.0
+# mypy>=1.8.0

@@ -1,0 +1,80 @@
+# Byte-level O-JEPA Tiny Configuration
+# For testing and development on limited hardware
+
+model:
+  # Byte encoder settings
+  byte_vocab_size: 256
+  byte_hidden_dim: 128
+  byte_num_layers: 1
+  byte_num_heads: 4
+  byte_max_seq_len: 4096
+
+  # Sequence lengths per modality (smaller for testing)
+  vision_seq_len: 768      # 16x16x3 RGB bytes
+  text_max_seq_len: 256    # Short text
+  audio_max_seq_len: 2000  # Short audio
+
+  # Active modalities
+  active_modalities:
+    - vision
+    - text
+
+  # Backbone
+  backbone:
+    hidden_dim: 128
+    num_layers: 2
+    num_heads: 4
+    mlp_ratio: 4.0
+    dropout: 0.0
+    max_seq_len: 4096
+
+  # Predictor
+  predictor:
+    hidden_dim: 128
+    output_dim: 128
+    num_layers: 2
+    num_heads: 4
+
+  # Decoders
+  decoders:
+    text:
+      hidden_dim: 64
+      num_layers: 1
+      max_len: 128
+    image:
+      hidden_dim: 64
+      image_size: 16
+      channels: 3
+    audio:
+      hidden_dim: 64
+      num_layers: 1
+      max_len: 2000
+
+  # Mojo acceleration (disabled for tiny)
+  use_mojo_rmsnorm: false
+
+training:
+  batch_size: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  betas:
+    - 0.9
+    - 0.95
+  total_steps: 1000
+  warmup_steps: 50
+  min_lr_ratio: 0.1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+
+  log_every_steps: 10
+  save_every_steps: 200
+  eval_every_steps: 100
+
+memory:
+  use_mixed_precision: false
+  use_gradient_checkpointing: false
+
+loss:
+  temperature: 0.07
+  learnable_temperature: false
+  vicreg_weight: 0.1

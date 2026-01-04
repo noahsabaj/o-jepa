@@ -1,0 +1,78 @@
+# LUMA Dataset Training Configuration
+# For training O-JEPA on the LUMA multimodal dataset
+# Dataset: bezirganyan/LUMA (local clone required)
+
+# Data settings
+data:
+  data_dir: /home/nsabaj/ai-workshop/LUMA/data
+  modalities:
+    - vision
+    - text
+    - audio
+  vision_seq_len: 3072      # 32x32x3 RGB bytes
+  text_max_seq_len: 1024    # Max text length in bytes
+  audio_max_seq_len: 8000   # 0.5s @ 16kHz as 8-bit PCM
+
+# Model settings
+model:
+  byte_hidden_dim: 512
+  byte_num_layers: 2
+  byte_num_heads: 8
+
+  backbone:
+    hidden_dim: 512
+    num_layers: 6
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.0
+
+  predictor:
+    hidden_dim: 512
+    num_layers: 4
+    num_heads: 8
+
+  vision_seq_len: 3072
+  text_max_seq_len: 1024
+  audio_max_seq_len: 8000
+  active_modalities:
+    - vision
+    - text
+    - audio
+
+  use_mojo_rmsnorm: true
+
+# Training settings
+training:
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  total_steps: 100000
+  warmup_steps: 1000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+
+  save_every_steps: 5000
+  eval_every_steps: 1000
+  log_every_steps: 100
+
+# Memory optimization
+memory:
+  use_mixed_precision: true
+  use_gradient_checkpointing: true
+
+# Loss settings
+loss:
+  temperature: 0.07
+  learnable_temperature: true
+  vicreg_weight: 0.1
+  lambda_variance: 25.0
+  lambda_covariance: 1.0
+
+# Training mode
+# source_modality and target_modality define the primary training pair
+# bidirectional=true trains both directions (A->B and B->A)
+training_mode:
+  source_modality: vision
+  target_modality: text
+  bidirectional: true

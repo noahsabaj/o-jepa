@@ -1,0 +1,83 @@
+# Byte-level O-JEPA Base Configuration
+# Standard configuration for training on consumer GPUs (8GB VRAM)
+
+model:
+  # Byte encoder settings
+  byte_vocab_size: 256
+  byte_hidden_dim: 512
+  byte_num_layers: 2
+  byte_num_heads: 8
+  byte_max_seq_len: 8192
+
+  # Sequence lengths per modality
+  vision_seq_len: 3072     # 32x32x3 RGB bytes
+  text_max_seq_len: 1024   # ~1KB text
+  audio_max_seq_len: 8000  # 0.5 sec @ 16kHz
+
+  # Active modalities
+  active_modalities:
+    - vision
+    - text
+    - audio
+
+  # Backbone
+  backbone:
+    hidden_dim: 512
+    num_layers: 6
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.0
+    max_seq_len: 8192
+
+  # Predictor
+  predictor:
+    hidden_dim: 512
+    output_dim: 512
+    num_layers: 4
+    num_heads: 8
+
+  # Decoders
+  decoders:
+    text:
+      hidden_dim: 256
+      num_layers: 2
+      max_len: 512
+    image:
+      hidden_dim: 256
+      image_size: 32
+      channels: 3
+    audio:
+      hidden_dim: 256
+      num_layers: 3
+      max_len: 8000
+
+  # Mojo acceleration
+  use_mojo_rmsnorm: true
+
+training:
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  betas:
+    - 0.9
+    - 0.95
+  total_steps: 100000
+  warmup_steps: 2000
+  min_lr_ratio: 0.1
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+
+  log_every_steps: 100
+  save_every_steps: 5000
+  eval_every_steps: 1000
+
+memory:
+  use_mixed_precision: true
+  use_gradient_checkpointing: true
+
+loss:
+  temperature: 0.07
+  learnable_temperature: true
+  vicreg_weight: 0.1
+  variance_weight: 1.0
+  covariance_weight: 0.04
