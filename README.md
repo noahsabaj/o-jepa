@@ -1,6 +1,6 @@
 # O-JEPA
 
-Omni-Joint Embedding Predictive Architecture.
+Omni-modality Joint Embedding Predictive Architecture.
 
 A byte-level world model following Yann LeCun's vision: predict abstract representations, not pixels.
 
