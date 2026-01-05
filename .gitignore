@@ -78,8 +78,8 @@ mlruns/
 tensorboard/
 
 # Data (too large for git)
-data/
-datasets/
+/data/
+/datasets/
 *.tar
 *.tar.gz
 *.zip

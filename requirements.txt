@@ -12,6 +12,10 @@ pillow>=12.1.0
 pyyaml>=6.0.3
 soundfile>=0.13.1  # For LUMA audio loading
 
+# Video decoding (for VideoAudioDataset)
+decord>=0.6.0  # Fast GPU-accelerated video decoding
+av>=10.0.0  # FFmpeg bindings for video/audio extraction
+
 # Progress visualization
 rich>=14.2.0  # For rich training dashboard (nested Live objects, Python 3.14 support)
 
