@@ -18,6 +18,11 @@ rich>=14.2.0  # For rich training dashboard (nested Live objects, Python 3.14 su
 # HuggingFace datasets (for LUMA streaming)
 datasets>=4.4.0
 
+# HuggingFace transformers (for Qwen3-4B language interface)
+transformers>=4.40.0
+accelerate>=1.5.0  # For device_map="auto"
+bitsandbytes>=0.45.0  # For 4-bit quantization (optional)
+
 # Testing
 pytest>=9.0.0
 pytest-cov>=7.0.0

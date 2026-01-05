@@ -18,9 +18,7 @@ from src.config import (
     ByteEncoderConfig,
     BackboneConfig,
     PredictorConfig,
-    TextDecoderConfig,
-    ImageDecoderConfig,
-    AudioDecoderConfig,
+    LanguageInterfaceConfig,
     DataConfig,
     TrainingConfig,
     get_tiny_config,
@@ -65,9 +63,6 @@ def vision_only_config() -> ByteJEPAConfig:
             num_heads=4,
             output_dim=128,
         ),
-        text_decoder=TextDecoderConfig(input_dim=128, hidden_dim=64),
-        image_decoder=ImageDecoderConfig(input_dim=128, hidden_dim=64),
-        audio_decoder=AudioDecoderConfig(input_dim=128, hidden_dim=64),
         data=DataConfig(
             vision_seq_len=768,  # 16x16x3
             text_max_seq_len=256,
@@ -99,9 +94,6 @@ def vision_text_config() -> ByteJEPAConfig:
             num_heads=4,
             output_dim=128,
         ),
-        text_decoder=TextDecoderConfig(input_dim=128, hidden_dim=64),
-        image_decoder=ImageDecoderConfig(input_dim=128, hidden_dim=64),
-        audio_decoder=AudioDecoderConfig(input_dim=128, hidden_dim=64),
         data=DataConfig(
             vision_seq_len=768,
             text_max_seq_len=256,
@@ -217,46 +209,28 @@ def byte_jepa_model(tiny_config: ByteJEPAConfig):
 
 
 # =============================================================================
-# DECODER FIXTURES
+# LANGUAGE INTERFACE FIXTURES
 # =============================================================================
 
 @pytest.fixture
-def text_decoder(tiny_config: ByteJEPAConfig):
-    """Create a tiny text decoder."""
-    from src.decoders import TextDecoder, TextDecoderConfig
-    config = TextDecoderConfig(
-        input_dim=tiny_config.backbone.hidden_dim,
-        hidden_dim=64,
-        num_layers=1,
-        max_output_len=128,
+def language_interface_config(tiny_config: ByteJEPAConfig) -> LanguageInterfaceConfig:
+    """Create language interface config matching tiny model."""
+    return LanguageInterfaceConfig(
+        ojepa_hidden_dim=tiny_config.backbone.hidden_dim,
+        num_soft_tokens=4,  # Smaller for tests
+        projection_hidden_dim=256,  # Smaller for tests (not full Qwen dim)
     )
-    return TextDecoder(config)
 
 
 @pytest.fixture
-def image_decoder(tiny_config: ByteJEPAConfig):
-    """Create a tiny image decoder."""
-    from src.decoders import ImageDecoder, ImageDecoderConfig
-    config = ImageDecoderConfig(
-        input_dim=tiny_config.backbone.hidden_dim,
-        hidden_dim=64,
-        output_size=(16, 16),
-        output_channels=3,
+def world_to_language_projection(language_interface_config: LanguageInterfaceConfig):
+    """Create projection layer for testing."""
+    from src.language_interface import WorldToLanguageProjection
+    return WorldToLanguageProjection(
+        ojepa_dim=language_interface_config.ojepa_hidden_dim,
+        qwen_dim=language_interface_config.projection_hidden_dim,
+        num_soft_tokens=language_interface_config.num_soft_tokens,
     )
-    return ImageDecoder(config)
-
-
-@pytest.fixture
-def audio_decoder(tiny_config: ByteJEPAConfig):
-    """Create a tiny audio decoder."""
-    from src.decoders import AudioDecoder, AudioDecoderConfig
-    config = AudioDecoderConfig(
-        input_dim=tiny_config.backbone.hidden_dim,
-        hidden_dim=64,
-        num_layers=1,
-        output_length=1000,
-    )
-    return AudioDecoder(config)
 
 
 # =============================================================================

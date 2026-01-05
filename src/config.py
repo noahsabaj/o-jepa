@@ -140,42 +140,23 @@ class EMAConfig:
 
 
 # =============================================================================
-# DECODER CONFIGURATIONS
+# LANGUAGE INTERFACE CONFIGURATION
 # =============================================================================
 
 @dataclass
-class DecoderConfig:
-    """Base configuration for modality decoders."""
-    input_dim: int = 512
-    hidden_dim: int = 256
-    num_layers: int = 2
-    num_heads: int = 4
-    dropout: float = 0.0
-
-
-@dataclass
-class TextDecoderConfig(DecoderConfig):
-    """Configuration for text (byte) decoder."""
-    vocab_size: int = 256  # Output byte vocabulary
-    max_output_len: int = 1024
-
-
-@dataclass
-class ImageDecoderConfig(DecoderConfig):
-    """Configuration for image decoder."""
-    output_size: Tuple[int, int] = (32, 32)  # Output image size
-    output_channels: int = 3  # RGB
-
-    @property
-    def output_bytes(self) -> int:
-        return self.output_size[0] * self.output_size[1] * self.output_channels
-
-
-@dataclass
-class AudioDecoderConfig(DecoderConfig):
-    """Configuration for audio decoder."""
-    output_length: int = 8000  # PCM bytes output length
-    sample_rate: int = 16000
+class LanguageInterfaceConfig:
+    """Configuration for Qwen3-4B language interface."""
+    qwen_model_name: str = "Qwen/Qwen3-4B"
+    num_soft_tokens: int = 8  # Number of prefix tokens from world embedding
+    projection_hidden_dim: int = 2560  # Qwen3-4B hidden size
+    ojepa_hidden_dim: int = 512  # O-JEPA output dim
+    freeze_qwen: bool = True  # Freeze Qwen weights
+    freeze_ojepa: bool = True  # Freeze O-JEPA weights (train projection only)
+    use_4bit: bool = False  # 4-bit quantization for 8GB GPUs
+    max_new_tokens: int = 256
+    temperature: float = 0.7
+    top_p: float = 0.9
+    device_map: str = "auto"
 
 
 # =============================================================================
@@ -281,10 +262,8 @@ class ByteJEPAConfig:
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     ema: EMAConfig = field(default_factory=EMAConfig)
 
-    # Decoders (optional, for generation tasks)
-    text_decoder: TextDecoderConfig = field(default_factory=TextDecoderConfig)
-    image_decoder: ImageDecoderConfig = field(default_factory=ImageDecoderConfig)
-    audio_decoder: AudioDecoderConfig = field(default_factory=AudioDecoderConfig)
+    # Language interface (optional, for generation)
+    language_interface: LanguageInterfaceConfig = field(default_factory=LanguageInterfaceConfig)
 
     # Loss and training
     loss: LossConfig = field(default_factory=LossConfig)
@@ -310,10 +289,9 @@ class ByteJEPAConfig:
                 f"backbone hidden_dim ({self.backbone.hidden_dim})"
             )
 
-        # Ensure decoders have correct input dim
-        for decoder in [self.text_decoder, self.image_decoder, self.audio_decoder]:
-            if decoder.input_dim != self.predictor.output_dim:
-                decoder.input_dim = self.predictor.output_dim
+        # Ensure language interface matches O-JEPA hidden dim
+        if self.language_interface.ojepa_hidden_dim != self.backbone.hidden_dim:
+            self.language_interface.ojepa_hidden_dim = self.backbone.hidden_dim
 
     @property
     def hidden_dim(self) -> int:
@@ -353,10 +331,12 @@ class ByteJEPAConfig:
             4 * d * d + 2 * d * self.predictor.mlp_dim
         )
 
-        # Decoders (lightweight)
-        decoder_params = 3 * (d * 256 + 256 * 256)
+        # Language interface projection (small)
+        qwen_dim = self.language_interface.projection_hidden_dim
+        num_tokens = self.language_interface.num_soft_tokens
+        projection_params = d * qwen_dim + qwen_dim * (qwen_dim * num_tokens)
 
-        return byte_encoder_params + backbone_params + predictor_params + decoder_params
+        return byte_encoder_params + backbone_params + predictor_params + projection_params
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for serialization."""
@@ -372,9 +352,7 @@ class ByteJEPAConfig:
             predictor=PredictorConfig(**d.get("predictor", {})),
             masking=MaskingConfig(**d.get("masking", {})),
             ema=EMAConfig(**d.get("ema", {})),
-            text_decoder=TextDecoderConfig(**d.get("text_decoder", {})),
-            image_decoder=ImageDecoderConfig(**d.get("image_decoder", {})),
-            audio_decoder=AudioDecoderConfig(**d.get("audio_decoder", {})),
+            language_interface=LanguageInterfaceConfig(**d.get("language_interface", {})),
             loss=LossConfig(**d.get("loss", {})),
             training=TrainingConfig(**d.get("training", {})),
             data=DataConfig(**d.get("data", {})),
@@ -433,9 +411,9 @@ def get_tiny_config() -> ByteJEPAConfig:
         ema=EMAConfig(
             ema_warmup_steps=100,
         ),
-        text_decoder=TextDecoderConfig(input_dim=256, hidden_dim=128),
-        image_decoder=ImageDecoderConfig(input_dim=256, hidden_dim=128),
-        audio_decoder=AudioDecoderConfig(input_dim=256, hidden_dim=128),
+        language_interface=LanguageInterfaceConfig(
+            ojepa_hidden_dim=256,
+        ),
         training=TrainingConfig(
             total_steps=1000,
             batch_size=2,
@@ -470,9 +448,9 @@ def get_small_config() -> ByteJEPAConfig:
             num_heads=6,
             output_dim=384,
         ),
-        text_decoder=TextDecoderConfig(input_dim=384, hidden_dim=192),
-        image_decoder=ImageDecoderConfig(input_dim=384, hidden_dim=192),
-        audio_decoder=AudioDecoderConfig(input_dim=384, hidden_dim=192),
+        language_interface=LanguageInterfaceConfig(
+            ojepa_hidden_dim=384,
+        ),
     )
 
 
