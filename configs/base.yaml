@@ -51,9 +51,6 @@ model:
       num_layers: 3
       max_len: 8000
 
-  # Mojo acceleration
-  use_mojo_rmsnorm: true
-
 training:
   batch_size: 32
   learning_rate: 1.0e-4

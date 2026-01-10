@@ -39,8 +39,6 @@ model:
     - text
     - audio
 
-  use_mojo_rmsnorm: true
-
 # Training settings
 training:
   batch_size: 32

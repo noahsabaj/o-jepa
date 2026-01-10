@@ -50,9 +50,6 @@ model:
       num_layers: 1
       max_len: 2000
 
-  # Mojo acceleration (disabled for tiny)
-  use_mojo_rmsnorm: false
-
 training:
   batch_size: 4
   learning_rate: 1.0e-4

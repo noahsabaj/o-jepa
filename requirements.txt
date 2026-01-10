@@ -34,10 +34,6 @@ pytest-cov>=7.0.0
 # Optimizers (Muon for faster convergence)
 pytorch-optimizer>=3.9.0
 
-# Mojo (optional, for accelerated RMSNorm)
-# Install via: pip install modular --extra-index-url https://modular.gateway.scarf.sh/simple/
-# Or standalone: pip install mojo --extra-index-url https://modular.gateway.scarf.sh/simple/
-
 # Development tools (optional)
 # black>=24.0.0
 # isort>=5.13.0
