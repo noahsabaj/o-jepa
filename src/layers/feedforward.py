@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..config import SWIGLU_HIDDEN_RATIO
+
 
 class SwiGLU(nn.Module):
     """
@@ -22,7 +24,7 @@ class SwiGLU(nn.Module):
 
     Args:
         dim: Input/output dimension
-        hidden_dim: Hidden dimension (if None, uses 4 * dim * 2/3 rounded to multiple of 256)
+        hidden_dim: Hidden dimension (if None, uses 4 * dim * SWIGLU_HIDDEN_RATIO rounded to 256)
         bias: Whether to use bias in linear layers
         dropout: Dropout rate
     """
@@ -39,9 +41,7 @@ class SwiGLU(nn.Module):
 
         # Compute hidden dimension
         if hidden_dim is None:
-            # Standard transformer uses 4x, but SwiGLU needs 2/3 of that
-            # to maintain similar param count (since we have 3 projections)
-            hidden_dim = int(4 * dim * 2 / 3)
+            hidden_dim = int(4 * dim * SWIGLU_HIDDEN_RATIO)
             # Round to nearest multiple of 256 for efficiency
             hidden_dim = ((hidden_dim + 255) // 256) * 256
 

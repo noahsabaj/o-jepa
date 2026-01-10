@@ -12,80 +12,12 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from .config import BackboneConfig, BACKBONE_MLP_ALIGNMENT
-from .layers import (
-    MultiHeadAttention,
-    SwiGLU,
-    RMSNorm,
-)
+from .layers import RMSNorm
+from .transformer_block import TransformerBlock
 
 
-class BackboneTransformerBlock(nn.Module):
-    """
-    Transformer block for the shared backbone.
-
-    Uses pre-normalization architecture:
-    - RMSNorm
-    - Multi-head self-attention with RoPE
-    - SwiGLU feedforward network
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        use_bias: bool = False,
-        max_seq_len: int = 8192,
-    ):
-        super().__init__()
-
-        # Pre-normalization layers
-        self.norm1 = RMSNorm(dim)
-        self.norm2 = RMSNorm(dim)
-
-        # Attention with RoPE
-        self.attn = MultiHeadAttention(
-            dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            bias=use_bias,
-            use_rope=True,
-            max_seq_len=max_seq_len,
-        )
-
-        # SwiGLU feedforward (aligned for tensor core efficiency)
-        mlp_dim = int(dim * mlp_ratio * 2 / 3)
-        mlp_dim = ((mlp_dim + BACKBONE_MLP_ALIGNMENT - 1) // BACKBONE_MLP_ALIGNMENT) * BACKBONE_MLP_ALIGNMENT
-        self.ffn = SwiGLU(
-            dim=dim,
-            hidden_dim=mlp_dim,
-            bias=use_bias,
-            dropout=dropout,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass with residual connections.
-
-        Args:
-            x: Input tensor [batch, seq_len, dim]
-            attention_mask: Optional mask [batch, seq_len]
-
-        Returns:
-            Output tensor [batch, seq_len, dim]
-        """
-        # Attention with residual
-        x = x + self.attn(self.norm1(x), attention_mask=attention_mask)
-
-        # FFN with residual
-        x = x + self.ffn(self.norm2(x))
-
-        return x
+# Alias for backwards compatibility
+BackboneTransformerBlock = TransformerBlock
 
 
 class SharedBackbone(nn.Module):
@@ -118,19 +50,24 @@ class SharedBackbone(nn.Module):
         # Learnable modality tokens (one per modality)
         # These are prepended to the input and help the model identify modality
         self.modality_tokens = nn.ParameterDict({
-            modality: nn.Parameter(torch.randn(1, 1, config.hidden_dim) * 0.02)
+            modality: nn.Parameter(torch.zeros(1, 1, config.hidden_dim))
             for modality in config.modalities
         })
+        # Initialize modality tokens with trunc_normal (consistent with other embeddings)
+        for token in self.modality_tokens.values():
+            nn.init.trunc_normal_(token, std=0.02)
 
         # Determine max sequence length from config or use default
         max_seq_len = getattr(config, 'max_seq_len', 8192)
 
         # Transformer layers
+        # Uses BACKBONE_MLP_ALIGNMENT for tensor core efficiency on GPU
         self.layers = nn.ModuleList([
-            BackboneTransformerBlock(
+            TransformerBlock(
                 dim=config.hidden_dim,
                 num_heads=config.num_heads,
                 mlp_ratio=config.mlp_ratio,
+                mlp_dim_alignment=BACKBONE_MLP_ALIGNMENT,
                 dropout=config.dropout,
                 use_bias=config.use_bias,
                 max_seq_len=max_seq_len,

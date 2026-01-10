@@ -1,37 +1,62 @@
 """
-JEPA World Model Predictor
+ByteJEPA Predictor: Cross-Attention Predictor for Byte-Level JEPA
 
 Predicts target embeddings from context using cross-attention.
-Following I-JEPA: narrow predictor, learnable mask tokens, position-aware.
+Following I-JEPA's design: predictor must learn position through attention.
 
 Key insight: Predictor capacity should be limited to force encoder to learn.
+
+DESIGN: NO EXPLICIT POSITION EMBEDDINGS (I-JEPA Style)
+======================================================
+Following Y1 recommendation from Yann LeCun review:
+
+The predictor receives NO position information about which tokens to predict.
+Position must be inferred implicitly through cross-attention to context:
+- Context tokens have position information (from encoder's position embeddings)
+- Query tokens (mask tokens) attend to context to learn "where" to predict
+- This forces the encoder to embed position information in its representations
+
+Why this matters:
+    1. Pure I-JEPA: This matches the original I-JEPA formulation
+    2. Better representations: Encoder must learn position-aware features
+    3. No shortcut: Predictor cannot "cheat" by using explicit position
+
+BREAKING CHANGE (v0.6.0):
+    Models trained with explicit position embeddings (v0.5.x) are NOT
+    compatible with this version. Retraining is required.
+
+Note:
+    While the predictor still uses query self-attention (which I-JEPA doesn't),
+    this is a separate design choice that can be disabled via config (Y4).
 """
 
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from .config import PredictorConfig, PREDICTOR_MLP_ALIGNMENT
+from .config import PredictorConfig, PREDICTOR_MLP_ALIGNMENT, SWIGLU_HIDDEN_RATIO
 from .layers import (
     CrossAttention,
     MultiHeadAttention,
     SwiGLU,
     RMSNorm,
-    LearnedPositionalEmbedding,
 )
 
 
-class JEPAPredictorBlock(nn.Module):
+class ByteJEPAPredictorBlock(nn.Module):
     """
-    Predictor block with self-attention and cross-attention.
+    ByteJEPA predictor block with self-attention and cross-attention.
 
     Architecture:
         1. Self-attention among mask queries
         2. Cross-attention to context embeddings
         3. FFN
+
+    Note: Named ByteJEPA to distinguish from I-JEPA which doesn't use
+    self-attention among query tokens.
     """
 
     def __init__(
@@ -41,17 +66,23 @@ class JEPAPredictorBlock(nn.Module):
         context_dim: int,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        use_self_attention: bool = True,  # Y4: Optional query self-attention
     ):
         super().__init__()
+        self.use_self_attention = use_self_attention
 
-        # Self-attention among queries
-        self.norm1 = RMSNorm(dim)
-        self.self_attn = MultiHeadAttention(
-            dim=dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            use_rope=False,  # Using learned position embeddings instead
-        )
+        # Self-attention among queries (optional - Y4)
+        if use_self_attention:
+            self.norm1 = RMSNorm(dim)
+            self.self_attn = MultiHeadAttention(
+                dim=dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                use_rope=False,
+            )
+        else:
+            self.norm1 = None
+            self.self_attn = None
 
         # Cross-attention to context
         self.norm2 = RMSNorm(dim)
@@ -69,7 +100,7 @@ class JEPAPredictorBlock(nn.Module):
 
         # FFN (aligned for tensor core efficiency)
         self.norm3 = RMSNorm(dim)
-        mlp_dim = int(dim * mlp_ratio * 2 / 3)
+        mlp_dim = int(dim * mlp_ratio * SWIGLU_HIDDEN_RATIO)
         mlp_dim = ((mlp_dim + PREDICTOR_MLP_ALIGNMENT - 1) // PREDICTOR_MLP_ALIGNMENT) * PREDICTOR_MLP_ALIGNMENT
         self.ffn = SwiGLU(dim=dim, hidden_dim=mlp_dim, dropout=dropout)
 
@@ -90,8 +121,9 @@ class JEPAPredictorBlock(nn.Module):
         Returns:
             Updated queries [batch, num_targets, dim]
         """
-        # Self-attention among queries
-        queries = queries + self.self_attn(self.norm1(queries))
+        # Y4: Self-attention among queries (optional)
+        if self.use_self_attention:
+            queries = queries + self.self_attn(self.norm1(queries))
 
         # Project context if needed
         if self.context_proj is not None:
@@ -108,22 +140,26 @@ class JEPAPredictorBlock(nn.Module):
         return queries
 
 
-class JEPAPredictor(nn.Module):
+class ByteJEPAPredictor(nn.Module):
     """
-    JEPA World Model Predictor.
+    ByteJEPA World Model Predictor.
 
     Takes context embeddings and target positions, predicts target embeddings.
 
-    Architecture (following I-JEPA):
+    Architecture (inspired by I-JEPA, adapted for bytes):
         1. Learnable mask token (query for each target)
-        2. Add position embeddings to queries
+        2. Add position embeddings to queries (differs from I-JEPA)
         3. Cross-attention blocks: queries attend to context
         4. Project to output dimension
 
     Key design choices:
         - Narrow architecture (predictor_dim = encoder_dim // 2)
         - Limited depth (forces encoder to do heavy lifting)
-        - Position-aware predictions
+        - Explicit position embeddings (pragmatic for long byte sequences)
+
+    Note:
+        Named ByteJEPAPredictor to clarify this is a byte-level variant,
+        not a direct I-JEPA implementation. See module docstring for details.
 
     Args:
         config: PredictorConfig with hyperparameters
@@ -133,33 +169,31 @@ class JEPAPredictor(nn.Module):
         super().__init__()
         self.config = config
 
-        # Predictor dimension (narrower than encoder)
-        self.predictor_dim = config.hidden_dim // 2
+        # Predictor dimension (narrower than encoder, configurable via predictor_ratio)
+        self.predictor_dim = config.predictor_dim
         self.output_dim = config.output_dim
         self.context_dim = config.hidden_dim
 
         # Learnable mask token (will be expanded for each target position)
+        # Y1: NO position embeddings - pure I-JEPA style
+        # Position is inferred through cross-attention to context tokens
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.predictor_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
-
-        # Position embeddings for target positions
-        self.pos_embed = LearnedPositionalEmbedding(
-            max_seq_len=config.max_seq_len,
-            dim=self.predictor_dim,
-        )
 
         # Input projection (context -> predictor dim)
         self.input_proj = nn.Linear(self.context_dim, self.predictor_dim, bias=False)
         self.input_norm = RMSNorm(self.context_dim)
 
         # Predictor blocks
+        # Y4: use_query_self_attention controls whether queries attend to each other
         self.blocks = nn.ModuleList([
-            JEPAPredictorBlock(
+            ByteJEPAPredictorBlock(
                 dim=self.predictor_dim,
                 num_heads=max(1, config.num_heads // 2),
                 context_dim=self.predictor_dim,  # After input_proj
                 mlp_ratio=config.mlp_ratio,
                 dropout=config.dropout,
+                use_self_attention=config.use_query_self_attention,
             )
             for _ in range(config.num_layers)
         ])
@@ -184,7 +218,7 @@ class JEPAPredictor(nn.Module):
         context_emb: torch.Tensor,
         target_positions: List[torch.Tensor],
         context_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict target embeddings from context.
 
@@ -206,21 +240,16 @@ class JEPAPredictor(nn.Module):
         # Find max number of targets for padding
         max_targets = max(len(pos) for pos in target_positions)
 
-        # Create queries: expand mask token + add position embeddings
+        # Create queries: expand mask token for all targets
+        # Y1: NO position embeddings added - pure I-JEPA style
+        # Position is learned through cross-attention to context tokens
         queries = self.mask_token.expand(batch_size, max_targets, -1).clone()
 
         # Create validity mask for predictions
         pred_mask = torch.zeros(batch_size, max_targets, dtype=torch.bool, device=device)
-
-        # Add position embeddings for each target
         for b in range(batch_size):
             num_targets = len(target_positions[b])
             pred_mask[b, :num_targets] = True
-
-            if num_targets > 0:
-                pos_indices = target_positions[b].to(device)
-                pos_emb = self.pos_embed(pos_indices)
-                queries[b, :num_targets] = queries[b, :num_targets] + pos_emb
 
         # Apply predictor blocks
         for block in self.blocks:
@@ -270,75 +299,11 @@ class JEPAPredictor(nn.Module):
         )
 
 
-class SimplePredictor(nn.Module):
-    """
-    Simple MLP predictor without cross-attention.
+# =============================================================================
+# BACKWARDS COMPATIBILITY ALIASES
+# =============================================================================
+# These aliases maintain backwards compatibility with code using old names.
+# New code should use ByteJEPAPredictor and ByteJEPAPredictorBlock.
 
-    For ablation studies or simpler use cases.
-    """
-
-    def __init__(self, config: PredictorConfig):
-        super().__init__()
-        self.hidden_dim = config.hidden_dim
-        self.output_dim = config.output_dim
-
-        # Simple MLP: context + position -> prediction
-        self.proj = nn.Sequential(
-            nn.Linear(config.hidden_dim * 2, config.hidden_dim, bias=False),
-            nn.GELU(),
-            nn.Linear(config.hidden_dim, config.output_dim, bias=False),
-        )
-
-        # Position embedding
-        self.pos_embed = LearnedPositionalEmbedding(
-            max_seq_len=config.max_seq_len,
-            dim=config.hidden_dim,
-        )
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.proj:
-            if isinstance(m, nn.Linear):
-                nn.init.trunc_normal_(m.weight, std=0.02)
-
-    def forward(
-        self,
-        context_emb: torch.Tensor,
-        target_positions: List[torch.Tensor],
-        context_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Predict target embeddings."""
-        batch_size = context_emb.shape[0]
-        device = context_emb.device
-
-        max_targets = max(len(pos) for pos in target_positions)
-        predictions = torch.zeros(batch_size, max_targets, self.output_dim, device=device)
-        pred_mask = torch.zeros(batch_size, max_targets, dtype=torch.bool, device=device)
-
-        # Pool context (simple mean)
-        if context_mask is not None:
-            mask = context_mask.unsqueeze(-1)
-            context_pooled = (context_emb * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        else:
-            context_pooled = context_emb.mean(dim=1)
-
-        for b in range(batch_size):
-            num_targets = len(target_positions[b])
-            pred_mask[b, :num_targets] = True
-
-            if num_targets > 0:
-                pos_indices = target_positions[b].to(device)
-                pos_emb = self.pos_embed(pos_indices)
-
-                # Expand context for each target
-                ctx = context_pooled[b:b+1].expand(num_targets, -1)
-
-                # Concatenate context and position, project
-                combined = torch.cat([ctx, pos_emb], dim=-1)
-                predictions[b, :num_targets] = self.proj(combined)
-
-        return predictions, pred_mask
-
-    def get_num_params(self) -> int:
-        return sum(p.numel() for p in self.parameters())
+JEPAPredictor = ByteJEPAPredictor
+JEPAPredictorBlock = ByteJEPAPredictorBlock

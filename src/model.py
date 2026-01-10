@@ -5,6 +5,24 @@ Following Yann LeCun's vision: predict abstract representations, not pixels.
 The model learns to understand the world by predicting masked region embeddings.
 
 Key insight: Low prediction error = consistent with world model.
+
+API PARADIGM: FLATTENED BYTE SEQUENCES
+======================================
+ALL inputs are 1D flattened byte sequences [batch, seq_len], regardless of modality:
+- Text:  UTF-8 bytes, naturally 1D
+- Audio: PCM samples as bytes, naturally 1D
+- Vision: RGB pixels MUST be pre-flattened to [batch, H*W*C]
+  Example: 32x32 RGB image -> [batch, 3072] where 3072 = 32*32*3
+
+The height/width parameters in forward() are ONLY used for 2D block masking.
+They do NOT change the input format - inputs are always flattened byte sequences.
+
+When using block masking for images:
+    loss, outputs = model(flat_image_bytes, modality="vision", height=32, width=32)
+    # flat_image_bytes shape: [batch, 32*32*3] NOT [batch, 32, 32, 3]
+
+When using span masking (default) for any modality:
+    loss, outputs = model(byte_ids, modality="text")  # height/width ignored
 """
 
 from typing import Dict, Optional, Tuple, Any, List
@@ -35,8 +53,8 @@ class TargetEncoder(nn.Module):
         self,
         byte_encoder: ByteEncoder,
         backbone: SharedBackbone,
-        ema_decay_start: float = 0.996,
-        ema_decay_end: float = 0.9999,
+        ema_decay_initial: float = 0.996,
+        ema_decay_final: float = 0.9999,
         ema_warmup_steps: int = 10000,
     ):
         super().__init__()
@@ -50,8 +68,8 @@ class TargetEncoder(nn.Module):
             param.requires_grad = False
 
         # EMA schedule
-        self.ema_decay_start = ema_decay_start
-        self.ema_decay_end = ema_decay_end
+        self.ema_decay_initial = ema_decay_initial
+        self.ema_decay_final = ema_decay_final
         self.ema_warmup_steps = ema_warmup_steps
         self.current_step = 0
 
@@ -59,9 +77,9 @@ class TargetEncoder(nn.Module):
     def ema_decay(self) -> float:
         """Get current EMA decay value (scheduled)."""
         if self.ema_warmup_steps <= 0:
-            return self.ema_decay_end
+            return self.ema_decay_final
         progress = min(self.current_step / self.ema_warmup_steps, 1.0)
-        return self.ema_decay_start + progress * (self.ema_decay_end - self.ema_decay_start)
+        return self.ema_decay_initial + progress * (self.ema_decay_final - self.ema_decay_initial)
 
     @torch.no_grad()
     def update(self, online_byte_encoder: nn.Module, online_backbone: nn.Module):
@@ -105,6 +123,14 @@ class TargetEncoder(nn.Module):
         # Process through backbone
         sequence, _ = self.backbone(byte_emb, modality, attention_mask=None)
 
+        # Y7: Gradient leakage assertion - target encoder outputs must never require gradients
+        # This ensures no gradients flow back through the EMA-updated target encoder,
+        # which would violate the JEPA training paradigm (predictor learns, target encoder follows via EMA)
+        assert not sequence.requires_grad, (
+            "Target encoder output requires gradients! This would cause gradient leakage. "
+            "Ensure forward() is called within torch.no_grad() context."
+        )
+
         return sequence
 
     def state_dict_ema(self) -> dict:
@@ -113,8 +139,8 @@ class TargetEncoder(nn.Module):
             "byte_encoder": self.byte_encoder.state_dict(),
             "backbone": self.backbone.state_dict(),
             "current_step": self.current_step,
-            "ema_decay_start": self.ema_decay_start,
-            "ema_decay_end": self.ema_decay_end,
+            "ema_decay_initial": self.ema_decay_initial,
+            "ema_decay_final": self.ema_decay_final,
             "ema_warmup_steps": self.ema_warmup_steps,
         }
 
@@ -123,8 +149,8 @@ class TargetEncoder(nn.Module):
         self.byte_encoder.load_state_dict(state_dict["byte_encoder"])
         self.backbone.load_state_dict(state_dict["backbone"])
         self.current_step = state_dict["current_step"]
-        self.ema_decay_start = state_dict.get("ema_decay_start", self.ema_decay_start)
-        self.ema_decay_end = state_dict.get("ema_decay_end", self.ema_decay_end)
+        self.ema_decay_initial = state_dict.get("ema_decay_initial", self.ema_decay_initial)
+        self.ema_decay_final = state_dict.get("ema_decay_final", self.ema_decay_final)
         self.ema_warmup_steps = state_dict.get("ema_warmup_steps", self.ema_warmup_steps)
 
 
@@ -157,7 +183,21 @@ class JEPAWorldModel(nn.Module):
         - evaluate_action(): Compute energy of a state-action pair
     """
 
-    def __init__(self, config: ByteJEPAConfig):
+    def __init__(
+        self,
+        config: ByteJEPAConfig,
+        mask_generator: Optional[nn.Module] = None,
+    ):
+        """
+        Initialize JEPA World Model.
+
+        Args:
+            config: Model configuration
+            mask_generator: Optional custom mask generator. If not provided,
+                creates default based on config.masking settings.
+                Must implement: __call__(batch_size, seq_len, device) ->
+                    (context_mask, target_mask, target_positions)
+        """
         super().__init__()
         self.config = config
 
@@ -172,23 +212,26 @@ class JEPAWorldModel(nn.Module):
         self.target_encoder = TargetEncoder(
             byte_encoder=self.byte_encoder,
             backbone=self.backbone,
-            ema_decay_start=config.ema.ema_decay_start,
-            ema_decay_end=config.ema.ema_decay_end,
+            ema_decay_initial=config.ema.ema_decay_initial,
+            ema_decay_final=config.ema.ema_decay_final,
             ema_warmup_steps=config.ema.ema_warmup_steps,
         )
 
-        # Mask generator
-        masking_config = MaskingConfig(
-            num_target_blocks=config.masking.num_target_blocks,
-            target_scale_min=config.masking.target_scale_min,
-            target_scale_max=config.masking.target_scale_max,
-            target_aspect_ratio=config.masking.target_aspect_ratio,
-            allow_target_overlap=config.masking.allow_target_overlap,
-        )
-        if config.masking.masking_type == "block":
-            self.mask_generator = BlockMaskGenerator(masking_config)
+        # Mask generator (user-provided or default from config)
+        if mask_generator is not None:
+            self.mask_generator = mask_generator
         else:
-            self.mask_generator = SpanMaskGenerator(masking_config)
+            masking_config = MaskingConfig(
+                num_target_blocks=config.masking.num_target_blocks,
+                target_scale_min=config.masking.target_scale_min,
+                target_scale_max=config.masking.target_scale_max,
+                target_aspect_ratio=config.masking.target_aspect_ratio,
+                allow_target_overlap=config.masking.allow_target_overlap,
+            )
+            if config.masking.masking_type == "block":
+                self.mask_generator = BlockMaskGenerator(masking_config)
+            else:
+                self.mask_generator = SpanMaskGenerator(masking_config)
 
         # Loss function
         self.loss_fn = JEPALoss(config.loss)
@@ -203,7 +246,7 @@ class JEPAWorldModel(nn.Module):
         print(f"  Hidden dim: {self.config.hidden_dim}")
         print(f"  Total parameters: {total_params:,}")
         print(f"  Trainable parameters: {trainable_params:,}")
-        print(f"  EMA decay: {self.config.ema.ema_decay_start} -> {self.config.ema.ema_decay_end}")
+        print(f"  EMA decay: {self.config.ema.ema_decay_initial} -> {self.config.ema.ema_decay_final}")
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -248,14 +291,25 @@ class JEPAWorldModel(nn.Module):
         JEPA training forward pass.
 
         Args:
-            byte_ids: Raw bytes [batch, seq_len]
-            modality: Modality name
-            height: Optional height for 2D masking
-            width: Optional width for 2D masking
+            byte_ids: Raw bytes [batch, seq_len]. MUST be flattened 1D sequence.
+                For images: pre-flatten [B, H, W, C] -> [B, H*W*C] before passing.
+                For text/audio: naturally 1D, pass directly.
+            modality: Modality name ("vision", "text", or "audio")
+            height: Optional spatial height for 2D BLOCK masking only.
+                Only used when config.masking.masking_type == "block".
+                For span masking (default), this is ignored.
+            width: Optional spatial width for 2D BLOCK masking only.
+                Only used when config.masking.masking_type == "block".
+                For span masking (default), this is ignored.
 
         Returns:
             loss: Scalar loss value
             outputs: Dictionary with metrics and debug info
+
+        Note:
+            height/width do NOT change the input format. They only inform the
+            BlockMaskGenerator how to interpret the 1D sequence as a 2D grid
+            for generating spatially contiguous mask blocks.
         """
         batch_size, seq_len = byte_ids.shape
         device = byte_ids.device
@@ -461,6 +515,140 @@ class JEPAWorldModel(nn.Module):
         sequence, pooled = self.backbone(byte_emb, modality, attention_mask)
 
         return pooled
+
+    # =========================================================================
+    # AUTOREGRESSIVE / PLANNING CAPABILITIES
+    # =========================================================================
+
+    @torch.no_grad()
+    def rollout(
+        self,
+        byte_ids: torch.Tensor,
+        modality: str,
+        num_steps: int,
+        step_size: int = 1,
+        context_window: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Autoregressive rollout: predict future states iteratively.
+
+        This enables planning by rolling out predicted states:
+            state_0 -> predictor -> state_1 (predicted)
+            state_0 + state_1 -> predictor -> state_2 (predicted)
+            ...
+
+        Note: This operates in EMBEDDING space, not byte space.
+        The model predicts abstract representations, not raw bytes.
+        This is by design (JEPA predicts representations, not pixels).
+
+        For planning algorithms (CEM, MCTS, etc.), use this to:
+        1. Rollout candidate action sequences
+        2. Evaluate final state embeddings
+        3. Select actions that lead to desired states
+
+        Args:
+            byte_ids: Initial state as bytes [batch, seq_len]
+            modality: Modality name
+            num_steps: Number of steps to roll out
+            step_size: Positions to advance per step
+            context_window: How many past positions to use as context
+                           (None = use all available)
+
+        Returns:
+            Predicted embeddings at each step [batch, num_steps, hidden_dim]
+
+        Example:
+            # Predict 5 future states
+            future_states = model.rollout(byte_ids, "text", num_steps=5)
+            # future_states[b, t] = predicted embedding at step t for batch b
+        """
+        batch_size, seq_len = byte_ids.shape
+        device = byte_ids.device
+        hidden_dim = self.config.hidden_dim
+
+        # Initialize with encoding of current state
+        byte_emb = self.byte_encoder(byte_ids, attention_mask=None)
+        current_sequence, _ = self.backbone(byte_emb, modality, attention_mask=None)
+
+        # Store rollout predictions
+        rollout_predictions = torch.zeros(
+            batch_size, num_steps, hidden_dim, device=device
+        )
+
+        current_pos = seq_len  # Start predicting after the input
+
+        for step in range(num_steps):
+            # Position to predict
+            predict_pos = current_pos + step * step_size
+
+            # Context: use last context_window positions, or all
+            if context_window is not None:
+                context_start = max(0, current_sequence.shape[1] - context_window)
+                context = current_sequence[:, context_start:]
+            else:
+                context = current_sequence
+
+            # Predict next position
+            # Create position tensor for predictor
+            target_positions = [
+                torch.tensor([predict_pos], device=device)
+                for _ in range(batch_size)
+            ]
+
+            predictions, _ = self.predictor(
+                context,
+                target_positions,
+                context_mask=None,
+            )
+
+            # Store prediction
+            rollout_predictions[:, step] = predictions[:, 0]
+
+            # Append prediction to sequence for next iteration
+            # This is the autoregressive part: use predicted state as new context
+            current_sequence = torch.cat([
+                current_sequence,
+                predictions,
+            ], dim=1)
+
+        return rollout_predictions
+
+    @torch.no_grad()
+    def evaluate_trajectory(
+        self,
+        byte_ids: torch.Tensor,
+        modality: str,
+        trajectory_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Evaluate how well a trajectory of embeddings matches the world model.
+
+        Used for planning: given candidate trajectories, score them by
+        how consistent they are with the learned world model.
+
+        Args:
+            byte_ids: Initial state [batch, seq_len]
+            modality: Modality name
+            trajectory_embeddings: Candidate trajectory [batch, traj_len, hidden_dim]
+
+        Returns:
+            Energy (lower = more consistent) [batch]
+        """
+        batch_size = byte_ids.shape[0]
+        traj_len = trajectory_embeddings.shape[1]
+        device = byte_ids.device
+
+        # Roll out from initial state
+        predicted_trajectory = self.rollout(
+            byte_ids, modality, num_steps=traj_len
+        )
+
+        # Compare predicted vs given trajectory
+        # Energy = MSE between predicted and given
+        diff = predicted_trajectory - trajectory_embeddings
+        energy = (diff ** 2).sum(dim=-1).mean(dim=-1)  # [batch]
+
+        return energy
 
     # =========================================================================
     # CHECKPOINT METHODS

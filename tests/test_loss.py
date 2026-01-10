@@ -155,6 +155,52 @@ class TestJEPALoss:
         assert not torch.isnan(loss)
         assert loss >= 0
 
+    def test_redundancy_loss(self, batch_size, num_targets, hidden_dim):
+        """Y2: Test VICReg-style redundancy loss."""
+        config = JEPALossConfig(use_redundancy_loss=True, redundancy_weight=1.0)
+        loss_fn = JEPALoss(config)
+
+        # Create predictions with correlated features (should have high redundancy_loss)
+        base = torch.randn(batch_size, num_targets, 1)
+        predictions = base.expand(-1, -1, hidden_dim) + torch.randn(batch_size, num_targets, hidden_dim) * 0.1
+        targets = torch.randn(batch_size, num_targets, hidden_dim)
+
+        loss, metrics = loss_fn(predictions, targets)
+
+        assert not torch.isnan(loss)
+        assert "redundancy_loss" in metrics
+        assert "off_diag_mean" in metrics
+        # Correlated features should have non-zero redundancy loss
+        assert metrics["redundancy_loss"] > 0
+
+    def test_redundancy_loss_disabled(self, batch_size, num_targets, hidden_dim):
+        """Test with redundancy loss disabled (default)."""
+        config = JEPALossConfig(use_redundancy_loss=False)
+        loss_fn = JEPALoss(config)
+
+        predictions = torch.randn(batch_size, num_targets, hidden_dim)
+        targets = torch.randn(batch_size, num_targets, hidden_dim)
+
+        loss, metrics = loss_fn(predictions, targets)
+
+        assert metrics["redundancy_loss"] == 0.0
+        assert metrics["off_diag_mean"] == 0.0
+
+    def test_redundancy_loss_independent_features(self, batch_size, num_targets, hidden_dim):
+        """Y2: Independent features should have low redundancy loss."""
+        config = JEPALossConfig(use_redundancy_loss=True, redundancy_weight=1.0)
+        loss_fn = JEPALoss(config)
+
+        # Create predictions with independent features (low correlation)
+        predictions = torch.randn(batch_size, num_targets, hidden_dim)
+        targets = torch.randn(batch_size, num_targets, hidden_dim)
+
+        _, metrics = loss_fn(predictions, targets)
+
+        # Independent features should have relatively low off-diagonal correlation
+        # (not exactly zero due to random sampling, but smaller than correlated case)
+        assert metrics["off_diag_mean"] < 0.5  # Reasonable threshold for uncorrelated features
+
 
 class TestSmoothL1Loss:
     """Tests for SmoothL1Loss wrapper."""

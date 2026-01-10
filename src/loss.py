@@ -70,6 +70,16 @@ class JEPALoss(nn.Module):
             )
 
         # Apply mask if provided
+        # Normalization logic:
+        #   pred_loss shape: [batch, num_targets, hidden_dim]
+        #   mask shape: [batch, num_targets] - True for valid targets
+        #
+        #   We normalize by total number of VALUES (not samples):
+        #   - mask.sum() = number of valid target positions across batch
+        #   - predictions.shape[-1] = hidden_dim
+        #   - Dividing by (valid_positions * hidden_dim) gives per-value loss
+        #
+        #   This is equivalent to: mean over valid positions, then mean over dims
         if mask is not None:
             pred_loss = pred_loss * mask.unsqueeze(-1)
             pred_loss = pred_loss.sum() / (mask.sum() * predictions.shape[-1] + 1e-8)
@@ -80,24 +90,52 @@ class JEPALoss(nn.Module):
         var_loss = torch.tensor(0.0, device=predictions.device)
         std_mean = 0.0
 
-        if self.config.use_variance_loss:
-            # Flatten to [total_predictions, dim]
-            pred_flat = predictions.reshape(-1, predictions.shape[-1])
+        # Flatten for regularization losses
+        pred_flat = predictions.reshape(-1, predictions.shape[-1])
 
-            if pred_flat.shape[0] > 1:
-                std = pred_flat.std(dim=0)
-                std_mean = std.mean().item()
-                # Penalize if std drops below target
-                var_loss = F.relu(self.config.variance_target - std).mean()
+        if self.config.use_variance_loss and pred_flat.shape[0] > 1:
+            std = pred_flat.std(dim=0)
+            std_mean = std.mean().item()
+            # Penalize if std drops below target
+            var_loss = F.relu(self.config.variance_target - std).mean()
+
+        # Y2: VICReg-style redundancy loss (decorrelates features)
+        # Minimizes off-diagonal covariance to prevent feature redundancy
+        redundancy_loss = torch.tensor(0.0, device=predictions.device)
+        off_diag_mean = 0.0
+
+        if self.config.use_redundancy_loss and pred_flat.shape[0] > 1:
+            # Center the embeddings
+            pred_centered = pred_flat - pred_flat.mean(dim=0, keepdim=True)
+
+            # Compute covariance matrix: C = (1/N) * X^T @ X
+            # Shape: [dim, dim]
+            n_samples = pred_centered.shape[0]
+            cov = (pred_centered.T @ pred_centered) / (n_samples - 1 + 1e-8)
+
+            # Extract off-diagonal elements and penalize
+            # The diagonal is variance (handled by variance loss)
+            # Off-diagonal is correlation between features
+            dim = cov.shape[0]
+            off_diag_mask = ~torch.eye(dim, dtype=torch.bool, device=cov.device)
+            off_diag = cov[off_diag_mask]
+            redundancy_loss = (off_diag ** 2).mean()
+            off_diag_mean = off_diag.abs().mean().item()
 
         # Combined loss
-        total_loss = pred_loss + self.config.variance_weight * var_loss
+        total_loss = (
+            pred_loss
+            + self.config.variance_weight * var_loss
+            + self.config.redundancy_weight * redundancy_loss
+        )
 
         metrics = {
             "loss": total_loss.item(),
             "pred_loss": pred_loss.item(),
             "var_loss": var_loss.item() if isinstance(var_loss, torch.Tensor) else var_loss,
             "std_mean": std_mean,
+            "redundancy_loss": redundancy_loss.item() if isinstance(redundancy_loss, torch.Tensor) else redundancy_loss,
+            "off_diag_mean": off_diag_mean,
         }
 
         return total_loss, metrics

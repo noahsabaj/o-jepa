@@ -110,6 +110,46 @@ class TestJEPAPredictorBlock:
         out = block(queries, context)
         assert out.shape == queries.shape
 
+    def test_without_self_attention(self, batch_size, hidden_dim):
+        """Y4: Test block without query self-attention (pure I-JEPA style)."""
+        block = JEPAPredictorBlock(
+            dim=hidden_dim,
+            num_heads=4,
+            context_dim=hidden_dim * 2,
+            use_self_attention=False,
+        )
+
+        # Self-attention components should be None
+        assert block.self_attn is None
+        assert block.norm1 is None
+
+        queries = torch.randn(batch_size, 10, hidden_dim)
+        context = torch.randn(batch_size, 64, hidden_dim * 2)
+
+        out = block(queries, context)
+        assert out.shape == queries.shape
+
+    def test_self_attention_param_count(self, hidden_dim):
+        """Y4: Test that disabling self-attention reduces parameters."""
+        block_with_sa = JEPAPredictorBlock(
+            dim=hidden_dim,
+            num_heads=4,
+            context_dim=hidden_dim * 2,
+            use_self_attention=True,
+        )
+        block_without_sa = JEPAPredictorBlock(
+            dim=hidden_dim,
+            num_heads=4,
+            context_dim=hidden_dim * 2,
+            use_self_attention=False,
+        )
+
+        params_with = sum(p.numel() for p in block_with_sa.parameters())
+        params_without = sum(p.numel() for p in block_without_sa.parameters())
+
+        # Should have fewer parameters without self-attention
+        assert params_without < params_with
+
 
 class TestJEPAPredictor:
     """Tests for JEPAPredictor."""
@@ -293,11 +333,57 @@ class TestJEPAPredictor:
         """Test that mask token is learnable."""
         assert predictor.mask_token.requires_grad
 
-    def test_position_embedding(self, predictor):
-        """Test that position embeddings are applied."""
-        # Position embedding should be part of the predictor
-        assert hasattr(predictor, 'pos_embed')
-        assert predictor.pos_embed is not None
+    def test_no_position_embedding(self, predictor):
+        """Y1: Test that predictor has NO explicit position embeddings.
+
+        Following I-JEPA design: position is inferred through cross-attention
+        to context tokens, not explicitly added to query tokens.
+        """
+        # pos_embed should NOT exist (removed in Y1)
+        assert not hasattr(predictor, 'pos_embed'), (
+            "Predictor should NOT have pos_embed - pure I-JEPA style"
+        )
+
+    def test_without_query_self_attention(self, batch_size, hidden_dim):
+        """Y4: Test predictor without query self-attention (pure I-JEPA style)."""
+        config = PredictorConfig(
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            num_layers=2,
+            num_heads=4,
+            max_seq_len=1024,
+            use_query_self_attention=False,
+        )
+        predictor = JEPAPredictor(config)
+
+        # All blocks should have self-attention disabled
+        for block in predictor.blocks:
+            assert block.self_attn is None
+            assert block.norm1 is None
+
+        context = torch.randn(batch_size, 64, hidden_dim)
+        target_positions = [torch.tensor([5, 10, 15]) for _ in range(batch_size)]
+
+        predictions, pred_mask = predictor(context, target_positions)
+
+        assert predictions.shape == (batch_size, 3, hidden_dim)
+        assert not torch.isnan(predictions).any()
+
+    def test_self_attention_config_default(self, hidden_dim):
+        """Y4: Test that query self-attention is ON by default."""
+        config = PredictorConfig(
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            num_layers=2,
+            num_heads=4,
+            max_seq_len=1024,
+        )
+        predictor = JEPAPredictor(config)
+
+        # All blocks should have self-attention enabled by default
+        for block in predictor.blocks:
+            assert block.self_attn is not None
+            assert block.norm1 is not None
 
 
 class TestPredictorIntegration:
