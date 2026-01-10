@@ -1,65 +1,65 @@
-# Production Trial Config for O-JEPA
-# Target: ~35M parameters on T4 (16GB VRAM)
-# Dataset: LUMA (~35K samples)
-# Expected training time: ~20-30 hours
+# H200 Trial Config for O-JEPA
+  # Target: ~35M parameters on H200 (80GB VRAM)
+  # Dataset: LUMA vision (~35K samples)
+  # Expected training time: ~15-20 minutes
 
-model:
-  byte_encoder:
-    hidden_dim: 384
-    num_layers: 2
-    num_heads: 8
-    max_seq_len: 8192
+  model:
+    byte_encoder:
+      hidden_dim: 384
+      num_layers: 2
+      num_heads: 8
+      max_seq_len: 8192
 
-  backbone:
-    hidden_dim: 384
-    num_layers: 12
-    num_heads: 8
+    backbone:
+      hidden_dim: 384
+      num_layers: 12
+      num_heads: 8
 
-  predictor:
-    hidden_dim: 384
-    num_layers: 4
-    num_heads: 8
-    output_dim: 384
+    predictor:
+      hidden_dim: 384
+      num_layers: 4
+      num_heads: 8
+      output_dim: 384
 
-  masking:
-    num_target_blocks: 4
-    target_scale_min: 0.15
-    target_scale_max: 0.25
-    context_scale_min: 0.85
-    context_scale_max: 1.0
+    masking:
+      num_target_blocks: 4
+      target_scale_min: 0.15
+      target_scale_max: 0.25
+      context_scale_min: 0.85
+      context_scale_max: 1.0
 
-  ema:
-    ema_decay_min: 0.996
-    ema_decay_max: 0.9999
-    ema_warmup_steps: 1000
+    ema:
+      ema_decay_min: 0.996
+      ema_decay_max: 0.9999
+      ema_warmup_steps: 500
 
-training:
-  # T4 has 16GB - can fit batch_size=16
-  batch_size: 16
-  gradient_accumulation_steps: 4
-  # effective_batch = 16 * 4 = 64
+  training:
+    # H200 has 80GB - go big
+    batch_size: 128
+    gradient_accumulation_steps: 2
+    # effective_batch = 128 * 2 = 256
 
-  # ~10K steps = ~18 epochs over 35K samples (fits in 80hr T4 budget)
-  total_steps: 10000
+    # 2K steps = ~15 epochs (good trial)
+    total_steps: 2000
 
-  # Optimizer
-  use_muon: true
-  muon_lr: 1.5e-2
-  adamw_lr: 5e-4
-  weight_decay: 0.05
+    # Optimizer
+    use_muon: true
+    muon_lr: 1.5e-2
+    adamw_lr: 5e-4
+    weight_decay: 0.05
 
-  # Scheduler
-  warmup_steps: 500
+    # Scheduler (faster warmup for shorter run)
+    warmup_steps: 200
 
-  # Regularization
-  dropout: 0.1
+    # Regularization
+    dropout: 0.1
 
-  # Logging
-  log_every: 100
-  eval_every: 1000
-  save_every: 2500
+    # Logging (more frequent for trial)
+    log_every: 50
+    eval_every: 500
+    save_every: 1000
 
-data:
-  modality: vision
-  vision_seq_len: 3072  # 32x32x3
-  image_size: [32, 32]
+  data:
+    modality: vision
+    vision_seq_len: 3072
+    image_size: [32, 32]
