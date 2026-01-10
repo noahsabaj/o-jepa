@@ -71,6 +71,12 @@ def parse_args():
         default=10,
         help="Log every N steps",
     )
+    parser.add_argument(
+        "--grad_accum",
+        type=int,
+        default=8,
+        help="Gradient accumulation steps (effective_batch = batch_size * grad_accum)",
+    )
     return parser.parse_args()
 
 
@@ -115,7 +121,7 @@ def main():
     print("=" * 60)
     print(f"Data directory: {args.data_dir}")
     print(f"Modality: {args.modality}")
-    print(f"Batch size: {args.batch_size}")
+    print(f"Batch size: {args.batch_size} x {args.grad_accum} accum = {args.batch_size * args.grad_accum} effective")
     print(f"Steps: {args.num_steps}")
     print(f"Hierarchical encoding: always enabled (scales 4, 16, 64)")
     print(f"Hidden dim: {args.hidden_dim}")
@@ -195,6 +201,7 @@ def main():
         learning_rate=1e-4,  # Base for scheduler
         total_steps=args.num_steps,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
     )
     optimizer = create_optimizer(model, config=training_config)
     print()
@@ -252,35 +259,44 @@ def main():
     step = 0
     total_loss = 0.0
     start_time = time.time()
+    accum_loss = 0.0
 
     data_iter = iter(dataloader)
 
     while step < args.num_steps:
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
-
-        # Move to device
-        byte_ids = batch[args.modality].to(device)
-
-        # Forward pass
         optimizer.zero_grad()
-        loss, outputs = model(byte_ids, modality=args.modality)
 
-        # Backward pass
-        loss.backward()
+        # Gradient accumulation loop
+        for accum_step in range(args.grad_accum):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                batch = next(data_iter)
 
-        # Gradient clipping
+            # Move to device
+            byte_ids = batch[args.modality].to(device)
+
+            # Forward pass (scale loss for accumulation)
+            loss, outputs = model(byte_ids, modality=args.modality)
+            scaled_loss = loss / args.grad_accum
+
+            # Backward pass (gradients accumulate)
+            scaled_loss.backward()
+
+            accum_loss += loss.item()
+
+        # Gradient clipping (after accumulation)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-        # Optimizer step
+        # Optimizer step (once per accumulated batch)
         optimizer.step()
         scheduler.step()
 
-        total_loss += loss.item()
+        step_loss = accum_loss / args.grad_accum
+        total_loss += step_loss
         step += 1
+        accum_loss = 0.0
 
         # Logging
         if step % args.log_every == 0 or step == 1:
@@ -298,7 +314,7 @@ def main():
 
             print(
                 f"Step {step:4d}/{args.num_steps} | "
-                f"Loss: {loss.item():.4f} | "
+                f"Loss: {step_loss:.4f} | "
                 f"Avg: {avg_loss:.4f} | "
                 f"LR: {current_lr:.2e} | "
                 f"Speed: {steps_per_sec:.1f} steps/s"
