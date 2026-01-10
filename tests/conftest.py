@@ -18,7 +18,6 @@ from src.config import (
     ByteEncoderConfig,
     BackboneConfig,
     PredictorConfig,
-    LanguageInterfaceConfig,
     DataConfig,
     TrainingConfig,
     get_tiny_config,
@@ -206,31 +205,6 @@ def byte_jepa_model(tiny_config: ByteJEPAConfig):
     """Create a tiny ByteJEPA model."""
     from src.model import JEPAWorldModel
     return JEPAWorldModel(tiny_config)
-
-
-# =============================================================================
-# LANGUAGE INTERFACE FIXTURES
-# =============================================================================
-
-@pytest.fixture
-def language_interface_config(tiny_config: ByteJEPAConfig) -> LanguageInterfaceConfig:
-    """Create language interface config matching tiny model."""
-    return LanguageInterfaceConfig(
-        ojepa_hidden_dim=tiny_config.backbone.hidden_dim,
-        num_soft_tokens=4,  # Smaller for tests
-        projection_hidden_dim=256,  # Smaller for tests (not full Qwen dim)
-    )
-
-
-@pytest.fixture
-def world_to_language_projection(language_interface_config: LanguageInterfaceConfig):
-    """Create projection layer for testing."""
-    from src.language_interface import WorldToLanguageProjection
-    return WorldToLanguageProjection(
-        ojepa_dim=language_interface_config.ojepa_hidden_dim,
-        qwen_dim=language_interface_config.projection_hidden_dim,
-        num_soft_tokens=language_interface_config.num_soft_tokens,
-    )
 
 
 # =============================================================================

@@ -26,9 +26,7 @@ class TrainingInfo:
     warmup_steps: int
     device: str
     mixed_precision: bool
-    bidirectional: bool
-    source_modality: str
-    target_modality: str
+    modality: str
 
 
 class ProgressReporter:
@@ -44,7 +42,7 @@ class ProgressReporter:
         print(f"ByteJEPA Training")
         print(f"{'='*60}")
         print(f"Parameters: {model_info.total_params/1e6:.1f}M")
-        print(f"Modalities: {training_info.source_modality} <-> {training_info.target_modality}")
+        print(f"Modality: {training_info.modality}")
         print(f"Steps: {training_info.total_steps:,} | Batch: {training_info.batch_size}")
         print(f"Device: {training_info.device} | AMP: {training_info.mixed_precision}")
         print(f"{'='*60}\n")

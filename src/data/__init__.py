@@ -2,6 +2,43 @@
 Byte-level O-JEPA Data Module.
 
 Provides byte-level data loading for training and evaluation.
+
+DATA API CONTRACT
+=================
+
+All datasets return a dictionary with the following structure:
+
+Required Keys (at least one modality):
+    - "text": torch.Tensor[seq_len] - byte IDs (0-255) for text
+    - "vision": torch.Tensor[H*W*3] - flattened RGB bytes for vision
+    - "audio": torch.Tensor[samples] - audio bytes
+
+Optional Keys:
+    - "masks": Dict[str, torch.Tensor] - attention masks per modality
+        - masks[modality]: torch.Tensor[seq_len], dtype=bool
+        - True = valid token, False = padding
+
+Example dataset output:
+    {
+        "text": tensor([72, 101, 108, 108, 111]),  # "Hello" in UTF-8
+        "vision": tensor([...]),  # H*W*3 RGB bytes
+        "masks": {
+            "text": tensor([True, True, True, True, True]),
+            "vision": tensor([True, True, ...]),
+        }
+    }
+
+Collator output (after batching):
+    {
+        "text": tensor([B, max_seq_len]),  # padded batch
+        "text_mask": tensor([B, max_seq_len]),  # attention mask
+        "vision": tensor([B, H*W*3]),
+        "vision_mask": tensor([B, H*W*3]),
+    }
+
+Training expects:
+    - batch[modality]: torch.Tensor[B, seq_len] - byte IDs
+    - batch[modality + "_mask"]: torch.Tensor[B, seq_len] - attention mask (optional)
 """
 
 # Byte-level datasets
@@ -17,44 +54,12 @@ from .luma_dataset import (
     LUMAMockDataset,
 )
 
-# Video+Audio datasets (universal dock)
-from .video_dataset import (
-    VideoAudioDataset,
-    VideoAudioMockDataset,
-    get_format_adapter,
-)
-
-# Format adapters
-from .formats import (
-    FormatAdapter,
-    ClipInfo,
-    GenericVideoAdapter,
-    EgoExo4DAdapter,
-    FORMAT_REGISTRY,
-    register_format,
-    get_available_formats,
-)
-
 # Byte-level collators
 from .collator import (
     ByteCollator,
     PairedByteCollator,
     MultiModalByteCollator,
     get_collator,
-)
-
-# Byte-level transforms
-from .transforms import (
-    ByteNoise,
-    ByteMask,
-    ByteShift,
-    ByteCrop,
-    ImageByteFlip,
-    ComposeByteTransforms,
-    get_byte_vision_transforms,
-    get_byte_text_transforms,
-    get_byte_audio_transforms,
-    get_all_byte_transforms,
 )
 
 __all__ = [
@@ -65,32 +70,9 @@ __all__ = [
     # LUMA datasets
     "LUMALocalDataset",
     "LUMAMockDataset",
-    # Video+Audio datasets
-    "VideoAudioDataset",
-    "VideoAudioMockDataset",
-    "get_format_adapter",
-    # Format adapters
-    "FormatAdapter",
-    "ClipInfo",
-    "GenericVideoAdapter",
-    "EgoExo4DAdapter",
-    "FORMAT_REGISTRY",
-    "register_format",
-    "get_available_formats",
     # Collators
     "ByteCollator",
     "PairedByteCollator",
     "MultiModalByteCollator",
     "get_collator",
-    # Transforms
-    "ByteNoise",
-    "ByteMask",
-    "ByteShift",
-    "ByteCrop",
-    "ImageByteFlip",
-    "ComposeByteTransforms",
-    "get_byte_vision_transforms",
-    "get_byte_text_transforms",
-    "get_byte_audio_transforms",
-    "get_all_byte_transforms",
 ]

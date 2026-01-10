@@ -3,7 +3,7 @@ O-JEPA: Omni-modality Joint Embedding Predictive Architecture
 
 Following Yann LeCun's vision: predict abstract representations, not pixels.
 The model learns to understand the world by predicting masked region embeddings.
-All modalities pass through the world model. Qwen speaks.
+All modalities pass through the unified byte encoder with hierarchical processing.
 """
 
 from .config import (
@@ -14,35 +14,33 @@ from .config import (
     MaskingConfig,
     EMAConfig,
     LossConfig,
-    LanguageInterfaceConfig,
     get_default_config,
     get_tiny_config,
 )
 from .model import JEPAWorldModel
-from .byte_encoder import ByteEncoder
+from .byte_encoder import ByteEncoder, HierarchicalChunking
 from .backbone import SharedBackbone
-from .predictor import JEPAPredictor
+from .predictor import ByteJEPAPredictor
 from .masking import BlockMaskGenerator, SpanMaskGenerator
 from .loss import JEPALoss
-from .language_interface import LanguageInterface, WorldToLanguageProjection
 
-__version__ = "0.5.0"  # Language interface: O-JEPA speaks through Qwen
+__version__ = "0.6.0"  # Hierarchical byte encoding is THE path
 __all__ = [
     # Main model
     "JEPAWorldModel",
-    # Language interface
-    "LanguageInterface",
-    "WorldToLanguageProjection",
     # Config
     "ByteJEPAConfig",
-    "LanguageInterfaceConfig",
+    "ByteEncoderConfig",
+    "BackboneConfig",
+    "PredictorConfig",
     "MaskingConfig",
     "EMAConfig",
     "LossConfig",
     # Components
     "ByteEncoder",
+    "HierarchicalChunking",
     "SharedBackbone",
-    "JEPAPredictor",
+    "ByteJEPAPredictor",
     "BlockMaskGenerator",
     "SpanMaskGenerator",
     "JEPALoss",
