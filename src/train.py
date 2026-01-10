@@ -14,7 +14,8 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Any, Tuple, List
+from typing import Dict, Optional, Any, Tuple, List, Union
+import warnings
 
 import torch
 import torch.nn as nn
@@ -22,7 +23,7 @@ import torch.distributed as dist
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 
-from .config import ByteJEPAConfig
+from .config import ByteJEPAConfig, TrainingConfig
 from .model import JEPAWorldModel
 from .progress import ProgressReporter, ModelInfo, TrainingInfo, SimpleReporter
 
@@ -102,11 +103,87 @@ class WSDScheduler:
 
 
 # =============================================================================
+# COMBINED OPTIMIZER (Muon + AdamW)
+# =============================================================================
+
+class CombinedOptimizer(torch.optim.Optimizer):
+    """
+    Combined optimizer that wraps Muon and AdamW for different parameter groups.
+
+    Native PyTorch Muon (2.9+) only accepts strictly 2D parameters, so we need
+    separate optimizers for 2D weights (Muon) and other params (AdamW).
+    This wrapper makes them behave as a single optimizer.
+    """
+
+    def __init__(
+        self,
+        muon_optimizer: torch.optim.Optimizer,
+        adamw_optimizer: torch.optim.Optimizer,
+    ):
+        # We don't call super().__init__ because we're wrapping optimizers
+        # instead of managing params directly
+        self.muon_optimizer = muon_optimizer
+        self.adamw_optimizer = adamw_optimizer
+
+        # Combined param_groups for compatibility (read-only view)
+        self._param_groups = []
+        for g in muon_optimizer.param_groups:
+            g_copy = dict(g)
+            g_copy['optimizer'] = 'muon'
+            self._param_groups.append(g_copy)
+        for g in adamw_optimizer.param_groups:
+            g_copy = dict(g)
+            g_copy['optimizer'] = 'adamw'
+            self._param_groups.append(g_copy)
+
+    @property
+    def param_groups(self):
+        """Return combined param groups."""
+        return self._param_groups
+
+    @property
+    def state(self):
+        """Return combined state dict (for compatibility)."""
+        combined = {}
+        combined.update(self.muon_optimizer.state)
+        combined.update(self.adamw_optimizer.state)
+        return combined
+
+    def zero_grad(self, set_to_none: bool = True):
+        """Zero gradients in both optimizers."""
+        self.muon_optimizer.zero_grad(set_to_none=set_to_none)
+        self.adamw_optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self, closure=None):
+        """Step both optimizers."""
+        loss = None
+        if closure is not None:
+            loss = closure()
+        self.muon_optimizer.step()
+        self.adamw_optimizer.step()
+        return loss
+
+    def state_dict(self):
+        """Return combined state dict."""
+        return {
+            'muon': self.muon_optimizer.state_dict(),
+            'adamw': self.adamw_optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load state dict into both optimizers."""
+        self.muon_optimizer.load_state_dict(state_dict['muon'])
+        self.adamw_optimizer.load_state_dict(state_dict['adamw'])
+
+
+# =============================================================================
 # OPTIMIZER CREATION
 # =============================================================================
 
 def create_optimizer(
     model: JEPAWorldModel,
+    config: Optional[TrainingConfig] = None,
+    # Legacy params for backward compatibility
     learning_rate: float = 1e-4,
     weight_decay: float = 0.05,
     betas: Tuple[float, float] = (0.9, 0.95),
@@ -116,78 +193,205 @@ def create_optimizer(
     Create optimizer with Muon/AdamW hybrid.
 
     Muon (Momentum Orthogonalized by Newton-schulz) is used for 2D weight matrices
-    for faster convergence. AdamW is used for 1D params (biases, norms, embeddings).
+    for faster convergence with higher learning rates. AdamW is used for 1D params,
+    embeddings, and norms with lower learning rates.
+
+    For native PyTorch Muon (2.9+), we create a CombinedOptimizer that wraps
+    separate Muon and AdamW optimizers since native Muon only accepts 2D params.
 
     Args:
         model: JEPAWorldModel model
-        learning_rate: Base learning rate
-        weight_decay: Weight decay
-        betas: Adam betas
-        use_muon: Whether to use Muon optimizer (falls back to AdamW if False or unavailable)
+        config: TrainingConfig with full optimizer settings (preferred)
+        learning_rate: Legacy - base learning rate (used if config not provided)
+        weight_decay: Legacy - weight decay (used if config not provided)
+        betas: Legacy - Adam betas (used if config not provided)
+        use_muon: Legacy - whether to use Muon (used if config not provided)
 
     Returns:
-        Configured optimizer
+        Configured optimizer (may be CombinedOptimizer for native Muon)
     """
-    # Try to import Muon
+    # Use config if provided, otherwise fall back to legacy params
+    if config is not None:
+        use_muon = config.use_muon
+        muon_lr = config.muon_lr
+        adamw_lr = config.adamw_lr
+        muon_momentum = config.muon_momentum
+        muon_nesterov = config.muon_nesterov
+        muon_ns_steps = config.muon_ns_steps
+        muon_weight_decay = config.muon_weight_decay
+        adamw_weight_decay = config.weight_decay
+        betas = config.betas
+        base_lr = config.learning_rate  # For scheduler reference
+        min_tokens = config.min_tokens_per_batch
+    else:
+        # Legacy mode: use same LR for both (old behavior)
+        muon_lr = learning_rate
+        adamw_lr = learning_rate
+        muon_momentum = 0.95
+        muon_nesterov = True
+        muon_ns_steps = 5
+        muon_weight_decay = 0.0
+        adamw_weight_decay = weight_decay
+        base_lr = learning_rate
+        min_tokens = 65536
+
+    # Try to import Muon (native PyTorch 2.9+ first, then pytorch_optimizer)
     muon_available = False
+    muon_class = None
+    muon_backend = None
+
     if use_muon:
+        # Try native PyTorch Muon first (available in PyTorch 2.9+)
         try:
-            from pytorch_optimizer import Muon
+            from torch.optim import Muon as NativeMuon
+            muon_class = NativeMuon
             muon_available = True
+            muon_backend = "native"
+            print("Using native torch.optim.Muon (PyTorch 2.9+)")
         except ImportError:
-            print("Warning: pytorch-optimizer not installed, falling back to AdamW")
-            print("Install with: pip install pytorch-optimizer")
+            # Fall back to pytorch_optimizer
+            try:
+                from pytorch_optimizer import Muon as POMuon
+                muon_class = POMuon
+                muon_available = True
+                muon_backend = "pytorch_optimizer"
+                print("Using pytorch_optimizer.Muon")
+            except ImportError:
+                print("Warning: Muon not available (need PyTorch 2.9+ or pytorch-optimizer)")
+                print("Falling back to AdamW")
 
     if muon_available:
-        # Muon hybrid: use Muon for 2D weights, AdamW for rest
-        muon_params = []  # 2D weight matrices (excluding embeddings)
-        adamw_params = []  # 1D params, embeddings, norms
+        # Separate parameters for Muon vs AdamW
+        muon_params = []  # Strictly 2D weight matrices (excluding embeddings/norms/heads)
+        adamw_params = []  # Everything else: 1D, 3D+, embeddings, norms, heads
 
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
 
-            # Muon works best on 2D weight matrices, excluding embeddings
-            is_2d_weight = param.ndim >= 2
+            # Muon works best on strictly 2D weight matrices, excluding special params
+            # Native PyTorch Muon ONLY accepts 2D params (ndim == 2 exactly)
+            is_2d_weight = param.ndim == 2
             is_embedding = 'embed' in name.lower()
             is_norm = 'norm' in name.lower()
+            is_head = 'head' in name.lower()  # Output heads excluded
 
-            if is_2d_weight and not is_embedding and not is_norm:
+            if is_2d_weight and not is_embedding and not is_norm and not is_head:
                 muon_params.append(param)
             else:
                 adamw_params.append(param)
 
-        param_groups = [
-            {
-                'params': muon_params,
-                'lr': learning_rate,
-                'weight_decay': weight_decay,
-                'use_muon': True,
-                'name': 'muon_weights',
-            },
-            {
-                'params': adamw_params,
-                'lr': learning_rate,
-                'weight_decay': weight_decay,
-                'use_muon': False,
-                'name': 'adamw_params',
-            },
-        ]
-
-        # Filter empty groups
-        param_groups = [g for g in param_groups if len(g['params']) > 0]
-
-        optimizer = Muon(
-            param_groups,
-            lr=learning_rate,
-            betas=betas,
-            weight_decay=weight_decay,
-            backend='newtonschulz5',
-        )
-
         muon_count = len(muon_params)
         adamw_count = len(adamw_params)
-        print(f"Using Muon optimizer: {muon_count} params with Muon, {adamw_count} params with AdamW")
+        print(
+            f"Muon optimizer: {muon_count} params with Muon (lr={muon_lr:.2e}), "
+            f"{adamw_count} params with AdamW (lr={adamw_lr:.2e})"
+        )
+
+        # Create optimizer based on backend
+        if muon_backend == "native":
+            # Native PyTorch Muon requires separate optimizers for 2D and non-2D params
+            # Build Muon param group
+            muon_param_groups = [
+                {
+                    'params': muon_params,
+                    'lr': muon_lr,
+                    'weight_decay': muon_weight_decay,
+                    'name': 'muon_weights',
+                    'lr_scale': muon_lr / base_lr if base_lr > 0 else 1.0,
+                },
+            ]
+
+            # Build AdamW param group
+            adamw_param_groups = [
+                {
+                    'params': adamw_params,
+                    'lr': adamw_lr,
+                    'weight_decay': adamw_weight_decay,
+                    'name': 'adamw_params',
+                    'lr_scale': adamw_lr / base_lr if base_lr > 0 else 1.0,
+                },
+            ]
+
+            # Filter empty groups
+            muon_param_groups = [g for g in muon_param_groups if len(g['params']) > 0]
+            adamw_param_groups = [g for g in adamw_param_groups if len(g['params']) > 0]
+
+            # Create separate optimizers
+            if muon_param_groups and adamw_param_groups:
+                muon_opt = muon_class(
+                    muon_param_groups,
+                    lr=muon_lr,
+                    momentum=muon_momentum,
+                    nesterov=muon_nesterov,
+                    ns_steps=muon_ns_steps,
+                    weight_decay=muon_weight_decay,
+                )
+                adamw_opt = torch.optim.AdamW(
+                    adamw_param_groups,
+                    lr=adamw_lr,
+                    betas=betas,
+                    weight_decay=adamw_weight_decay,
+                    fused=torch.cuda.is_available(),
+                )
+                optimizer = CombinedOptimizer(muon_opt, adamw_opt)
+            elif muon_param_groups:
+                # Only Muon params (unlikely)
+                optimizer = muon_class(
+                    muon_param_groups,
+                    lr=muon_lr,
+                    momentum=muon_momentum,
+                    nesterov=muon_nesterov,
+                    ns_steps=muon_ns_steps,
+                    weight_decay=muon_weight_decay,
+                )
+            else:
+                # Only AdamW params (unlikely)
+                optimizer = torch.optim.AdamW(
+                    adamw_param_groups,
+                    lr=adamw_lr,
+                    betas=betas,
+                    weight_decay=adamw_weight_decay,
+                    fused=torch.cuda.is_available(),
+                )
+        else:
+            # pytorch_optimizer Muon handles mixed param groups directly
+            param_groups = [
+                {
+                    'params': muon_params,
+                    'lr': muon_lr,
+                    'weight_decay': muon_weight_decay,
+                    'use_muon': True,
+                    'name': 'muon_weights',
+                    'lr_scale': muon_lr / base_lr if base_lr > 0 else 1.0,
+                },
+                {
+                    'params': adamw_params,
+                    'lr': adamw_lr,
+                    'weight_decay': adamw_weight_decay,
+                    'use_muon': False,
+                    'name': 'adamw_params',
+                    'lr_scale': adamw_lr / base_lr if base_lr > 0 else 1.0,
+                },
+            ]
+            param_groups = [g for g in param_groups if len(g['params']) > 0]
+
+            optimizer = muon_class(
+                param_groups,
+                lr=muon_lr,
+                betas=betas,
+                weight_decay=muon_weight_decay,
+                backend='newtonschulz5',
+            )
+
+        # Warn about batch size if config provided
+        if config is not None:
+            effective = config.effective_batch_size
+            if effective < 64:  # Very rough heuristic
+                warnings.warn(
+                    f"Muon works best with large batches. Current effective batch: {effective}. "
+                    f"Consider increasing batch_size or gradient_accumulation_steps."
+                )
 
         return optimizer
 
@@ -214,40 +418,41 @@ def create_optimizer(
         elif 'decoder' in name:
             decoder_params.append(param)
 
+    # Use adamw_lr for all groups in fallback mode
     param_groups = [
         {
             'params': predictor_2d_params,
-            'lr': learning_rate,
-            'weight_decay': weight_decay,
-            'lr_scale': 1.0,
+            'lr': adamw_lr,
+            'weight_decay': adamw_weight_decay,
+            'lr_scale': adamw_lr / base_lr if base_lr > 0 else 1.0,
             'name': 'predictor_2d',
         },
         {
             'params': predictor_other_params,
-            'lr': learning_rate,
-            'weight_decay': weight_decay,
-            'lr_scale': 1.0,
+            'lr': adamw_lr,
+            'weight_decay': adamw_weight_decay,
+            'lr_scale': adamw_lr / base_lr if base_lr > 0 else 1.0,
             'name': 'predictor_other',
         },
         {
             'params': backbone_params,
-            'lr': learning_rate,
-            'weight_decay': weight_decay,
-            'lr_scale': 1.0,
+            'lr': adamw_lr,
+            'weight_decay': adamw_weight_decay,
+            'lr_scale': adamw_lr / base_lr if base_lr > 0 else 1.0,
             'name': 'backbone',
         },
         {
             'params': encoder_params,
-            'lr': learning_rate * 0.5,  # Slightly reduced for encoder
-            'weight_decay': weight_decay,
-            'lr_scale': 0.5,
+            'lr': adamw_lr * 0.5,  # Slightly reduced for encoder
+            'weight_decay': adamw_weight_decay,
+            'lr_scale': (adamw_lr * 0.5) / base_lr if base_lr > 0 else 0.5,
             'name': 'byte_encoder',
         },
         {
             'params': decoder_params,
-            'lr': learning_rate,
-            'weight_decay': weight_decay,
-            'lr_scale': 1.0,
+            'lr': adamw_lr,
+            'weight_decay': adamw_weight_decay,
+            'lr_scale': adamw_lr / base_lr if base_lr > 0 else 1.0,
             'name': 'decoders',
         },
     ]
@@ -260,9 +465,9 @@ def create_optimizer(
 
     optimizer = torch.optim.AdamW(
         param_groups,
-        lr=learning_rate,
+        lr=adamw_lr,
         betas=betas,
-        weight_decay=weight_decay,
+        weight_decay=adamw_weight_decay,
         fused=use_fused,
     )
 
@@ -277,23 +482,6 @@ def create_optimizer(
 # =============================================================================
 
 @dataclass
-class TrainingConfig:
-    """Training hyperparameters."""
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.05
-    betas: Tuple[float, float] = (0.9, 0.95)
-    warmup_steps: int = 1000
-    total_steps: int = 100000
-    min_lr_ratio: float = 0.1
-    gradient_accumulation_steps: int = 1
-    max_grad_norm: float = 1.0
-    use_mixed_precision: bool = True
-    eval_every_steps: int = 1000
-    save_every_steps: int = 5000
-    log_every_steps: int = 100
-
-
-@dataclass
 class TrainingState:
     """Mutable training state."""
     step: int = 0
@@ -302,210 +490,6 @@ class TrainingState:
     total_samples: int = 0
 
 
-def train_step_bytes(
-    model: JEPAWorldModel,
-    batch: Dict[str, torch.Tensor],
-    optimizer: torch.optim.Optimizer,
-    scheduler: WSDScheduler,
-    scaler: Optional[GradScaler],
-    config: TrainingConfig,
-    state: TrainingState,
-    accumulation_step: int,
-    source_modality: str = "vision",
-    target_modality: str = "text",
-) -> Dict[str, float]:
-    """
-    Single training step with byte-level data.
-
-    Args:
-        model: JEPAWorldModel model
-        batch: Data batch with modality bytes and masks
-        optimizer: Optimizer
-        scheduler: LR scheduler
-        scaler: Gradient scaler for mixed precision
-        config: Training config
-        state: Training state
-        accumulation_step: Current accumulation step
-        source_modality: Source modality name
-        target_modality: Target modality name
-
-    Returns:
-        Metrics dictionary
-    """
-    device = next(model.parameters()).device
-    use_amp = scaler is not None
-
-    # Get source and target from batch
-    # Handles both paired collator format and basic format
-    if "source_bytes" in batch:
-        # PairedByteCollator format
-        source_bytes = batch["source_bytes"].to(device)
-        source_mask = batch["source_mask"].to(device)
-        target_bytes = batch["target_bytes"].to(device)
-        target_mask = batch["target_mask"].to(device)
-        source_mod = batch.get("source_modality", source_modality)
-        target_mod = batch.get("target_modality", target_modality)
-    else:
-        # Basic format: {modality}_bytes or just {modality}
-        source_key = f"{source_modality}_bytes" if f"{source_modality}_bytes" in batch else source_modality
-        target_key = f"{target_modality}_bytes" if f"{target_modality}_bytes" in batch else target_modality
-        source_bytes = batch[source_key].to(device)
-        target_bytes = batch[target_key].to(device)
-        source_mask = batch.get(f"{source_modality}_mask", torch.ones_like(source_bytes, dtype=torch.bool)).to(device)
-        target_mask = batch.get(f"{target_modality}_mask", torch.ones_like(target_bytes, dtype=torch.bool)).to(device)
-        source_mod = source_modality
-        target_mod = target_modality
-
-    # Forward pass with mixed precision
-    with autocast('cuda', enabled=use_amp):
-        loss, outputs = model(
-            source_bytes=source_bytes,
-            target_bytes=target_bytes,
-            source_modality=source_mod,
-            target_modality=target_mod,
-            source_mask=source_mask,
-            target_mask=target_mask,
-        )
-        # Scale loss for gradient accumulation
-        loss = loss / config.gradient_accumulation_steps
-
-    # Backward pass
-    if scaler is not None:
-        scaler.scale(loss).backward()
-    else:
-        loss.backward()
-
-    # Extract metrics from outputs
-    raw_metrics = outputs.get("metrics", {})
-    metrics = {k: v if isinstance(v, (int, float)) else v for k, v in raw_metrics.items()}
-
-    # Update weights on last accumulation step
-    is_update_step = (accumulation_step + 1) == config.gradient_accumulation_steps
-
-    if is_update_step:
-        if scaler is not None:
-            scaler.unscale_(optimizer)
-
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            config.max_grad_norm
-        )
-        metrics['grad_norm'] = grad_norm.item()
-
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-
-        scheduler.step()
-        optimizer.zero_grad()
-
-        state.step += 1
-        metrics['lr'] = scheduler.get_lr()
-
-    # Scale loss back for logging
-    metrics['loss'] = loss.item() * config.gradient_accumulation_steps
-    state.total_samples += source_bytes.shape[0]
-
-    return metrics
-
-
-def train_step_bidirectional_bytes(
-    model: JEPAWorldModel,
-    batch: Dict[str, torch.Tensor],
-    optimizer: torch.optim.Optimizer,
-    scheduler: WSDScheduler,
-    scaler: Optional[GradScaler],
-    config: TrainingConfig,
-    state: TrainingState,
-    accumulation_step: int,
-    modality_a: str = "vision",
-    modality_b: str = "text",
-) -> Dict[str, float]:
-    """
-    Bidirectional training step: A<->B both directions.
-
-    Args:
-        model: JEPAWorldModel model
-        batch: Data batch with byte tensors
-        optimizer: Optimizer
-        scheduler: LR scheduler
-        scaler: Gradient scaler
-        config: Training config
-        state: Training state
-        accumulation_step: Current accumulation step
-        modality_a: First modality
-        modality_b: Second modality
-
-    Returns:
-        Metrics dictionary
-    """
-    device = next(model.parameters()).device
-    use_amp = scaler is not None
-
-    # Get bytes for both modalities
-    if "source_bytes" in batch:
-        bytes_a = batch["source_bytes"].to(device)
-        mask_a = batch["source_mask"].to(device)
-        bytes_b = batch["target_bytes"].to(device)
-        mask_b = batch["target_mask"].to(device)
-    else:
-        key_a = f"{modality_a}_bytes" if f"{modality_a}_bytes" in batch else modality_a
-        key_b = f"{modality_b}_bytes" if f"{modality_b}_bytes" in batch else modality_b
-        bytes_a = batch[key_a].to(device)
-        bytes_b = batch[key_b].to(device)
-        mask_a = batch.get(f"{modality_a}_mask", torch.ones_like(bytes_a, dtype=torch.bool)).to(device)
-        mask_b = batch.get(f"{modality_b}_mask", torch.ones_like(bytes_b, dtype=torch.bool)).to(device)
-
-    with autocast('cuda', enabled=use_amp):
-        loss, outputs = model.forward_bidirectional(
-            modality_a_bytes=bytes_a,
-            modality_a_name=modality_a,
-            modality_b_bytes=bytes_b,
-            modality_b_name=modality_b,
-            mask_a=mask_a,
-            mask_b=mask_b,
-        )
-        loss = loss / config.gradient_accumulation_steps
-
-    if scaler is not None:
-        scaler.scale(loss).backward()
-    else:
-        loss.backward()
-
-    # Extract metrics from outputs
-    raw_metrics = outputs.get("metrics", {})
-    metrics = {k: v if isinstance(v, (int, float)) else v for k, v in raw_metrics.items()}
-
-    is_update_step = (accumulation_step + 1) == config.gradient_accumulation_steps
-
-    if is_update_step:
-        if scaler is not None:
-            scaler.unscale_(optimizer)
-
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            config.max_grad_norm
-        )
-        metrics['grad_norm'] = grad_norm.item()
-
-        if scaler is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-
-        scheduler.step()
-        optimizer.zero_grad()
-
-        state.step += 1
-        metrics['lr'] = scheduler.get_lr()
-
-    metrics['loss'] = loss.item() * config.gradient_accumulation_steps
-    state.total_samples += bytes_a.shape[0]
-
-    return metrics
 
 
 def train_step_jepa(
@@ -716,18 +700,16 @@ def train(
     resume_path: Optional[str] = None,
     device: str = 'cuda',
     use_wandb: bool = False,
-    bidirectional: bool = False,  # Default to JEPA mode (not bidirectional)
-    source_modality: str = "text",
-    target_modality: str = "text",
+    modality: str = "text",
     reporter: Optional[ProgressReporter] = None,
-    jepa_mode: bool = True,  # New: use JEPA world model training
 ):
     """
     Main training loop for JEPA World Model.
 
-    Two modes:
-    1. JEPA mode (jepa_mode=True): Single-modality masked prediction
-    2. Legacy mode (jepa_mode=False): Cross-modal contrastive (bidirectional)
+    Uses single-modality masked prediction (JEPA style):
+    - Mask portions of input sequence
+    - Predict masked embeddings from context
+    - EMA target encoder provides stable targets
 
     Args:
         model: JEPAWorldModel
@@ -739,11 +721,8 @@ def train(
         resume_path: Path to resume from
         device: Device to train on
         use_wandb: Whether to log to Weights & Biases
-        bidirectional: Whether to use bidirectional training (legacy mode)
-        source_modality: Modality for JEPA training or source for legacy
-        target_modality: Target modality for legacy mode
+        modality: Modality to train on ("text", "vision", "audio")
         reporter: Progress reporter for training output
-        jepa_mode: If True, use JEPA world model training (masked prediction)
     """
     # Default to SimpleReporter if none provided
     if reporter is None:
@@ -803,15 +782,10 @@ def train(
         warmup_steps=training_config.warmup_steps,
         device=device,
         mixed_precision=use_amp,
-        bidirectional=bidirectional if not jepa_mode else False,
-        source_modality=source_modality,
-        target_modality=target_modality if not jepa_mode else source_modality,
+        modality=modality,
     )
 
-    if jepa_mode:
-        print(f"JEPA World Model training: modality={source_modality}")
-    else:
-        print(f"Legacy mode: bidirectional={bidirectional}")
+    print(f"JEPA World Model training: modality={modality}")
 
     reporter.on_train_start(model_info, training_info)
 
@@ -825,45 +799,18 @@ def train(
             if state.step >= training_config.total_steps:
                 break
 
-            if jepa_mode:
-                # JEPA World Model: single-modality masked prediction
-                metrics = train_step_jepa(
-                    model=model,
-                    batch=batch,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    config=training_config,
-                    state=state,
-                    accumulation_step=accumulation_step,
-                    modality=source_modality,
-                )
-            elif bidirectional:
-                metrics = train_step_bidirectional_bytes(
-                    model=model,
-                    batch=batch,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    config=training_config,
-                    state=state,
-                    accumulation_step=accumulation_step,
-                    modality_a=source_modality,
-                    modality_b=target_modality,
-                )
-            else:
-                metrics = train_step_bytes(
-                    model=model,
-                    batch=batch,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    scaler=scaler,
-                    config=training_config,
-                    state=state,
-                    accumulation_step=accumulation_step,
-                    source_modality=source_modality,
-                    target_modality=target_modality,
-                )
+            # JEPA World Model: single-modality masked prediction
+            metrics = train_step_jepa(
+                model=model,
+                batch=batch,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                config=training_config,
+                state=state,
+                accumulation_step=accumulation_step,
+                modality=modality,
+            )
 
             accumulation_step = (accumulation_step + 1) % training_config.gradient_accumulation_steps
             running_loss += metrics['loss']
@@ -888,28 +835,15 @@ def train(
                     'total_steps': training_config.total_steps,
                 }
 
-                if jepa_mode:
-                    # JEPA World Model metrics
-                    log_metrics.update({
-                        'pred_loss': metrics.get('pred_loss'),
-                        'var_loss': metrics.get('var_loss'),
-                        'std_mean': metrics.get('std_mean'),
-                        'cosine_sim': metrics.get('cosine_sim'),
-                        'ema_decay': metrics.get('ema_decay'),
-                        'num_targets': metrics.get('num_targets'),
-                    })
-                else:
-                    # Legacy contrastive metrics
-                    log_metrics.update({
-                        'infonce': metrics.get('infonce'),
-                        'vicreg': metrics.get('vicreg'),
-                        'temperature': metrics.get('temperature'),
-                        'infonce_acc_p2t': metrics.get('infonce_acc_p2t'),
-                        'infonce_acc_t2p': metrics.get('infonce_acc_t2p'),
-                        'vicreg_var_loss': metrics.get('vicreg_var_loss'),
-                        'vicreg_cov_loss': metrics.get('vicreg_cov_loss'),
-                        'vicreg_std_mean': metrics.get('vicreg_std_mean'),
-                    })
+                # JEPA World Model metrics
+                log_metrics.update({
+                    'pred_loss': metrics.get('pred_loss'),
+                    'var_loss': metrics.get('var_loss'),
+                    'std_mean': metrics.get('std_mean'),
+                    'cosine_sim': metrics.get('cosine_sim'),
+                    'ema_decay': metrics.get('ema_decay'),
+                    'num_targets': metrics.get('num_targets'),
+                })
 
                 reporter.on_step(step=state.step, metrics=log_metrics)
 
@@ -930,8 +864,8 @@ def train(
                 and accumulation_step == 0):
                 val_loss, retrieval_metrics = evaluate(
                     model, val_loader, device,
-                    source_modality=source_modality,
-                    target_modality=target_modality,
+                    source_modality=modality,
+                    target_modality=modality,
                 )
 
                 is_best = val_loss < state.best_loss
@@ -972,6 +906,48 @@ def train(
     if use_wandb:
         import wandb
         wandb.finish()
+
+
+def compute_retrieval_metrics(
+    pred_embeds: torch.Tensor,
+    target_embeds: torch.Tensor,
+) -> Dict[str, float]:
+    """
+    Compute retrieval metrics (R@1, R@5, R@10).
+
+    For each prediction embedding, find the nearest target embedding
+    and check if it matches the ground truth.
+
+    Args:
+        pred_embeds: Prediction embeddings [N, D]
+        target_embeds: Target embeddings [N, D]
+
+    Returns:
+        Dictionary with R@1, R@5, R@10 metrics
+    """
+    # Normalize embeddings
+    pred_embeds = torch.nn.functional.normalize(pred_embeds, dim=-1)
+    target_embeds = torch.nn.functional.normalize(target_embeds, dim=-1)
+
+    # Compute cosine similarity matrix [N, N]
+    similarity = torch.matmul(pred_embeds, target_embeds.T)
+
+    # For each prediction, rank targets by similarity
+    _, indices = similarity.topk(k=min(10, similarity.shape[1]), dim=1)
+
+    # Ground truth is diagonal (pred[i] should match target[i])
+    ground_truth = torch.arange(len(pred_embeds), device=pred_embeds.device)
+
+    # Compute R@k
+    r_at_1 = (indices[:, 0] == ground_truth).float().mean().item()
+    r_at_5 = (indices[:, :5] == ground_truth.unsqueeze(1)).any(dim=1).float().mean().item()
+    r_at_10 = (indices == ground_truth.unsqueeze(1)).any(dim=1).float().mean().item()
+
+    return {
+        'R@1': r_at_1,
+        'R@5': r_at_5,
+        'R@10': r_at_10,
+    }
 
 
 def evaluate(
@@ -1118,7 +1094,7 @@ if __name__ == "__main__":  # pragma: no cover
     batch = next(iter(loader))
 
     state = TrainingState()
-    metrics = train_step_bytes(
+    metrics = train_step_jepa(
         model=model,
         batch=batch,
         optimizer=optimizer,
@@ -1127,8 +1103,7 @@ if __name__ == "__main__":  # pragma: no cover
         config=training_config,
         state=state,
         accumulation_step=0,
-        source_modality="vision",
-        target_modality="text",
+        modality="vision",
     )
 
     print(f"Training step completed!")
