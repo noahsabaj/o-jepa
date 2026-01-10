@@ -13,8 +13,6 @@ Key components:
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any
-import yaml
-from pathlib import Path
 
 
 # =============================================================================
@@ -27,6 +25,18 @@ from pathlib import Path
 BACKBONE_MLP_ALIGNMENT = 256  # Backbone MLP hidden dim rounded to this
 PREDICTOR_MLP_ALIGNMENT = 64  # Predictor MLP hidden dim rounded to this
 
+# SwiGLU MLP scaling factor.
+# Standard FFN: input -> 4x expansion -> output (2 projections: up + down)
+# SwiGLU FFN:   input -> gate & up -> element-wise multiply -> output (3 projections)
+#
+# To match parameter count with standard FFN at 4x expansion:
+#   Standard: 2 * (dim * 4*dim) = 8 * dim^2
+#   SwiGLU:   3 * (dim * hidden) = 8 * dim^2  =>  hidden = 8/3 * dim = 2.67 * dim
+#
+# So SwiGLU uses 2/3 of the standard 4x expansion: 4 * 2/3 = 2.67x
+# Reference: "GLU Variants Improve Transformer" (Shazeer, 2020)
+SWIGLU_HIDDEN_RATIO = 2 / 3
+
 
 # =============================================================================
 # BYTE ENCODER CONFIGURATION
@@ -34,7 +44,7 @@ PREDICTOR_MLP_ALIGNMENT = 64  # Predictor MLP hidden dim rounded to this
 
 @dataclass
 class ByteEncoderConfig:
-    """Configuration for unified byte encoder."""
+    """Configuration for unified byte encoder with hierarchical multi-scale processing."""
     vocab_size: int = 256  # All possible byte values (0-255)
     hidden_dim: int = 512
     num_layers: int = 2
@@ -43,6 +53,11 @@ class ByteEncoderConfig:
     dropout: float = 0.0
     use_bias: bool = False
     max_seq_len: int = 8192  # Maximum byte sequence length
+
+    # Hierarchical multi-scale encoding (Loom-inspired)
+    # Processes bytes at multiple scales with learned content-dependent gating
+    hierarchical_scales: Tuple[int, ...] = (4, 16, 64)  # Kernel sizes in bytes
+    hierarchical_gating: str = "softmax"  # Gating type: "softmax", "sigmoid", "linear"
 
     @property
     def mlp_dim(self) -> int:
@@ -78,7 +93,22 @@ class BackboneConfig:
 
 @dataclass
 class PredictorConfig:
-    """Configuration for JEPA predictor (cross-attention based)."""
+    """
+    Configuration for JEPA predictor (cross-attention based).
+
+    Design Decision: Narrow Predictor
+    ==================================
+    The predictor is intentionally narrower than the encoder (default 0.5x).
+    This forces the encoder to learn better representations since the
+    predictor has limited capacity to "memorize" or "cheat."
+
+    The predictor_ratio controls this:
+    - 0.5 (default): Predictor is half the width of encoder
+    - 0.33: Very narrow predictor (aggressive bottleneck)
+    - 1.0: Same width as encoder (no bottleneck)
+
+    Yann LeCun's I-JEPA uses a narrow predictor for this reason.
+    """
     hidden_dim: int = 512  # Input/context dimension (matches encoder)
     num_layers: int = 4    # Number of predictor blocks
     num_heads: int = 8
@@ -89,14 +119,22 @@ class PredictorConfig:
     use_gradient_checkpointing: bool = True
     max_seq_len: int = 8192  # For position embeddings
 
+    # Predictor width relative to encoder (0.5 = half width, 1.0 = same width)
+    predictor_ratio: float = 0.5
+
+    # Y4: Optional query self-attention (I-JEPA doesn't use self-attention among queries)
+    # True (default): Queries attend to each other before cross-attention
+    # False: Pure I-JEPA style - queries only attend to context
+    use_query_self_attention: bool = True
+
     @property
     def mlp_dim(self) -> int:
         return int(self.hidden_dim * self.mlp_ratio)
 
     @property
     def predictor_dim(self) -> int:
-        """Internal predictor dimension (narrower than encoder)."""
-        return self.hidden_dim // 2
+        """Internal predictor dimension (narrower than encoder by predictor_ratio)."""
+        return int(self.hidden_dim * self.predictor_ratio)
 
 
 # =============================================================================
@@ -122,6 +160,14 @@ class MaskingConfig:
     # Overlap control
     allow_target_overlap: bool = False
 
+    # Y3: Hierarchical masking (curriculum learning)
+    # When enabled, samples from both small and large scale ranges
+    # This forces the model to learn predictions at multiple granularities
+    use_hierarchical_masking: bool = False
+    small_scale_range: Tuple[float, float] = (0.05, 0.15)  # Fine-grained targets
+    large_scale_range: Tuple[float, float] = (0.40, 0.70)  # Coarse targets
+    hierarchical_small_prob: float = 0.5  # Probability of sampling small scales
+
 
 # =============================================================================
 # EMA CONFIGURATION
@@ -131,32 +177,12 @@ class MaskingConfig:
 class EMAConfig:
     """Configuration for Exponential Moving Average target encoder."""
     # EMA decay schedule
-    ema_decay_start: float = 0.996   # Initial decay (more updates)
-    ema_decay_end: float = 0.9999    # Final decay (fewer updates)
+    ema_decay_initial: float = 0.996   # Initial decay (more updates to target)
+    ema_decay_final: float = 0.9999   # Final decay (fewer updates, more stable)
     ema_warmup_steps: int = 10000    # Steps to reach final decay
 
     # Update frequency
     update_every: int = 1  # Update EMA every N optimizer steps
-
-
-# =============================================================================
-# LANGUAGE INTERFACE CONFIGURATION
-# =============================================================================
-
-@dataclass
-class LanguageInterfaceConfig:
-    """Configuration for Qwen3-4B language interface."""
-    qwen_model_name: str = "Qwen/Qwen3-4B"
-    num_soft_tokens: int = 8  # Number of prefix tokens from world embedding
-    projection_hidden_dim: int = 2560  # Qwen3-4B hidden size
-    ojepa_hidden_dim: int = 512  # O-JEPA output dim
-    freeze_qwen: bool = True  # Freeze Qwen weights
-    freeze_ojepa: bool = True  # Freeze O-JEPA weights (train projection only)
-    use_4bit: bool = False  # 4-bit quantization for 8GB GPUs
-    max_new_tokens: int = 256
-    temperature: float = 0.7
-    top_p: float = 0.9
-    device_map: str = "auto"
 
 
 # =============================================================================
@@ -173,7 +199,15 @@ class LossConfig:
     # Variance regularization (prevents collapse)
     use_variance_loss: bool = True
     variance_weight: float = 0.04
+    # Matches natural std of neural network outputs (~1.0 with standard init);
+    # yields ~0.03 loss for healthy embeddings, ~0.99 for collapsed embeddings
     variance_target: float = 1.0
+
+    # Y2: VICReg-style redundancy loss (decorrelates features)
+    # Prevents feature dimensions from becoming redundant/correlated
+    # Minimizes off-diagonal covariance matrix elements
+    use_redundancy_loss: bool = False  # Disabled by default for backwards compat
+    redundancy_weight: float = 0.01
 
     # Feature normalization
     normalize_predictions: bool = False
@@ -189,10 +223,22 @@ class LossConfig:
 @dataclass
 class TrainingConfig:
     """Configuration for training."""
-    # Optimizer
-    learning_rate: float = 1e-4
+    # Optimizer - General
+    learning_rate: float = 1e-4  # Base LR (used as reference for scheduler)
     weight_decay: float = 0.05
     betas: Tuple[float, float] = (0.9, 0.95)
+
+    # Optimizer - Muon-specific
+    # Muon (Momentum Orthogonalized by Newton-schulz) uses higher LR than AdamW
+    # and works best on 2D weight matrices (excluding embeddings/norms)
+    use_muon: bool = True  # Whether to use Muon for 2D weight params
+    muon_lr: float = 1.5e-2  # Muon learning rate (10-20x higher than AdamW)
+    adamw_lr: float = 5e-4  # AdamW learning rate for embeddings/norms/1D params
+    muon_momentum: float = 0.95  # Muon momentum factor
+    muon_nesterov: bool = True  # Use Nesterov momentum in Muon
+    muon_ns_steps: int = 5  # Newton-Schulz iteration steps
+    muon_weight_decay: float = 0.0  # Muon weight decay (often 0 works best)
+    min_tokens_per_batch: int = 65536  # Warn if below this (Muon prefers large batches)
 
     # Scheduler (Warmup-Stable-Decay)
     warmup_ratio: float = 0.01  # 1% warmup
@@ -262,9 +308,6 @@ class ByteJEPAConfig:
     masking: MaskingConfig = field(default_factory=MaskingConfig)
     ema: EMAConfig = field(default_factory=EMAConfig)
 
-    # Language interface (optional, for generation)
-    language_interface: LanguageInterfaceConfig = field(default_factory=LanguageInterfaceConfig)
-
     # Loss and training
     loss: LossConfig = field(default_factory=LossConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -288,10 +331,6 @@ class ByteJEPAConfig:
                 f"Predictor hidden_dim ({self.predictor.hidden_dim}) must match "
                 f"backbone hidden_dim ({self.backbone.hidden_dim})"
             )
-
-        # Ensure language interface matches O-JEPA hidden dim
-        if self.language_interface.ojepa_hidden_dim != self.backbone.hidden_dim:
-            self.language_interface.ojepa_hidden_dim = self.backbone.hidden_dim
 
     @property
     def hidden_dim(self) -> int:
@@ -331,12 +370,7 @@ class ByteJEPAConfig:
             4 * d * d + 2 * d * self.predictor.mlp_dim
         )
 
-        # Language interface projection (small)
-        qwen_dim = self.language_interface.projection_hidden_dim
-        num_tokens = self.language_interface.num_soft_tokens
-        projection_params = d * qwen_dim + qwen_dim * (qwen_dim * num_tokens)
-
-        return byte_encoder_params + backbone_params + predictor_params + projection_params
+        return byte_encoder_params + backbone_params + predictor_params
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for serialization."""
@@ -352,24 +386,11 @@ class ByteJEPAConfig:
             predictor=PredictorConfig(**d.get("predictor", {})),
             masking=MaskingConfig(**d.get("masking", {})),
             ema=EMAConfig(**d.get("ema", {})),
-            language_interface=LanguageInterfaceConfig(**d.get("language_interface", {})),
             loss=LossConfig(**d.get("loss", {})),
             training=TrainingConfig(**d.get("training", {})),
             data=DataConfig(**d.get("data", {})),
             active_modalities=tuple(d.get("active_modalities", ("vision", "text", "audio"))),
         )
-
-    def save(self, path: Path) -> None:
-        """Save config to YAML file."""
-        with open(path, "w") as f:
-            yaml.dump(self.to_dict(), f, default_flow_style=False)
-
-    @classmethod
-    def load(cls, path: Path) -> "ByteJEPAConfig":
-        """Load config from YAML file."""
-        with open(path, "r") as f:
-            d = yaml.safe_load(f)
-        return cls.from_dict(d)
 
 
 # =============================================================================
@@ -411,9 +432,6 @@ def get_tiny_config() -> ByteJEPAConfig:
         ema=EMAConfig(
             ema_warmup_steps=100,
         ),
-        language_interface=LanguageInterfaceConfig(
-            ojepa_hidden_dim=256,
-        ),
         training=TrainingConfig(
             total_steps=1000,
             batch_size=2,
@@ -447,9 +465,6 @@ def get_small_config() -> ByteJEPAConfig:
             num_layers=3,
             num_heads=6,
             output_dim=384,
-        ),
-        language_interface=LanguageInterfaceConfig(
-            ojepa_hidden_dim=384,
         ),
     )
 
