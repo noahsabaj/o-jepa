@@ -1,5 +1,6 @@
 # ByteJEPA World Model - .gitignore
 CLAUDE.md
+/.claude
 
 # =============================================================================
 # Python
